@@ -18,7 +18,8 @@
  */
 
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
-import { matchesKey, Key, truncateToWidth } from "@earendil-works/pi-tui";
+import { DynamicBorder } from "@earendil-works/pi-coding-agent";
+import { matchesKey, Key, truncateToWidth, Container, Text } from "@earendil-works/pi-tui";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
@@ -391,6 +392,95 @@ function registerThinkCommand(pi: ExtensionAPI): void {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// pi-turbo startup stats — bordered notice in the chat area at boot.
+// Reads ~/.pi-turbo/timings.json; skips silently if pi-turbo isn't
+// installed or didn't run this session (no error, no output).
+// ═══════════════════════════════════════════════════════════════════
+
+const TURBO_TIMINGS_FILE = path.join(os.homedir(), ".pi-turbo", "timings.json");
+const TURBO_FRESHNESS_MS = 120_000; // generous window for slow boots
+
+interface TurboStatsData {
+  extensions: number;
+  loadMs: number;
+  emaMs: number;
+  savedMs?: number;
+  pct?: number;
+}
+
+interface TurboTimingsFile {
+  history?: Array<{ ts?: string; n?: number; ms?: number }>;
+  ema?: number;
+}
+
+/** Read the most recent pi-turbo run if it's fresh (i.e. pi-turbo ran this boot). */
+function readLastTurboRun(): TurboStatsData | null {
+  try {
+    if (!existsSync(TURBO_TIMINGS_FILE)) return null;
+    const data = JSON.parse(readFileSync(TURBO_TIMINGS_FILE, "utf8")) as TurboTimingsFile;
+    const history = Array.isArray(data?.history) ? data.history : [];
+    const last = history[history.length - 1];
+    if (!last?.ts) return null;
+    const ts = Date.parse(last.ts);
+    if (!Number.isFinite(ts) || Date.now() - ts > TURBO_FRESHNESS_MS) return null;
+    const extensions = Number(last.n) || 0;
+    const loadMs = Number(last.ms) || 0;
+    if (extensions === 0 || loadMs === 0) return null;
+    return { extensions, loadMs, emaMs: Number(data.ema) || loadMs, ...readTurboSaved() };
+  } catch {
+    return null; // missing/unreadable/corrupt → skip silently
+  }
+}
+
+const TURBO_LAST_RUN_FILE = path.join(os.homedir(), ".pi-turbo", "last-run.json");
+
+/** Read this boot's acceleration stats (saved ms + %) from last-run.json. */
+function readTurboSaved(): { savedMs: number; pct: number } {
+  try {
+    if (!existsSync(TURBO_LAST_RUN_FILE)) return {};
+    const data = JSON.parse(readFileSync(TURBO_LAST_RUN_FILE, "utf8")) as {
+      ts?: string;
+      savedMs?: number;
+      pct?: number;
+      profiling?: boolean;
+      serial?: boolean;
+    };
+    if (!data?.ts) return {};
+    const ts = Date.parse(data.ts);
+    if (!Number.isFinite(ts) || Date.now() - ts > TURBO_FRESHNESS_MS) return {};
+    const savedMs = Number(data.savedMs) || 0;
+    if (data.profiling || data.serial || savedMs <= 0) return {};
+    return { savedMs, pct: Number(data.pct) || 0 };
+  } catch {
+    return {}; // missing/unreadable/corrupt → no saved stats
+  }
+}
+
+function registerPiTurboStats(pi: ExtensionAPI): void {
+  pi.registerEntryRenderer<TurboStatsData>("pi-turbo-stats", (entry, _opts, theme) => {
+    const d = entry.data;
+    if (!d) return undefined;
+    const box = new Container();
+    box.addChild(new DynamicBorder((t) => theme.fg("accent", t)));
+    const body =
+      `${theme.bold(theme.fg("accent", "⚡ pi-turbo"))}\n` +
+      `${theme.fg("muted", `${d.extensions} extensions loaded in `)}${d.loadMs}ms` +
+      `${theme.fg("muted", ` · EMA ${d.emaMs}ms`)}` +
+      (d.savedMs ? `${theme.fg("muted", ` · saved `)}${d.savedMs}ms (${d.pct ?? 0}%)` : "");
+    box.addChild(new Text(body, 1, 0));
+    box.addChild(new DynamicBorder((t) => theme.fg("accent", t)));
+    return box;
+  });
+
+  pi.on("session_start", (event) => {
+    if (event.reason !== "startup") return;
+    const stats = readLastTurboRun();
+    if (!stats) return; // pi-turbo absent/inactive/stale → skip silently
+    pi.appendEntry<TurboStatsData>("pi-turbo-stats", stats);
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // Default export
 // ═══════════════════════════════════════════════════════════════════
 
@@ -399,4 +489,5 @@ export default function (pi: ExtensionAPI): void {
   registerThinkCommand(pi);
   registerExtCommand(pi);
   registerSkillShortcuts(pi);
+  registerPiTurboStats(pi);
 }
