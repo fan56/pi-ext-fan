@@ -3,7 +3,12 @@
  *
  * Kept features:
  *   1. at-agent  — @agent syntax interception + autocomplete
- *   2. companions — 9-item family-bucket list (all npm: sources) installed via /ext
+ *   2. companions — 22-item family bucket in 3 groups (aiwayds / rpiv / ecosystem),
+ *      each entry having one of three action types:
+ *        - pi    : installed via `pi install <source>` (npm:@...)
+ *        - copy  : local files synced into ~/.pi/agent/agents (fun-agent agents,
+ *                  copied only when the target does not already exist)
+ *        - check : probe CLI presence (`command -v ...`), hint printed when missing
  *
  * Removed (replaced by standalone extensions):
  *   - sidebar      → @aiwayds/pi-sidebar-panel  (/sidebar command)
@@ -12,20 +17,32 @@
  *
  * Commands:
  *   /ext                — toggle at-agent on/off
- *   /ext status         — at-agent state + companion install status
- *   /ext all            — one-shot install of every missing companion (no picker, skips installed)
- *   /ext setup          — interactive picker (all selected by default) → install chosen companions
- *   /ext setup <name>   — install one companion
+ *   /ext status         — at-agent state + companion install status (grouped by aiwayds / rpiv / ecosystem)
+ *   /ext all            — one-shot: install every missing pi-type, sync copy-type, probe check-type
+ *   /ext setup          — interactive picker (all selected by default, grouped) → run chosen companions
+ *   /ext setup <name>   — run one companion (pi install / copy sync / check probe)
  *   /think              — cycle/set thinking level
  */
 
-import type { ExtensionAPI, ExtensionContext, Theme, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+  Theme,
+  ExtensionCommandContext,
+} from "@earendil-works/pi-coding-agent";
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
-import { matchesKey, Key, truncateToWidth, Container, Text } from "@earendil-works/pi-tui";
+import {
+  matchesKey,
+  Key,
+  truncateToWidth,
+  Container,
+  Text,
+} from "@earendil-works/pi-tui";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { existsSync, readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 
 // ═══════════════════════════════════════════════════════════════════
 // Feature State (at-agent is the only remaining feature)
@@ -39,7 +56,7 @@ const DEFAULT_STATE: FeatureState = {
   atAgent: true,
 };
 
-let state: FeatureState = { ...DEFAULT_STATE };
+const state: FeatureState = { ...DEFAULT_STATE };
 
 const AT_AGENT_ALIASES = new Set(["at-agent", "at_agent", "atagent"]);
 
@@ -47,44 +64,333 @@ const AT_AGENT_ALIASES = new Set(["at-agent", "at_agent", "atagent"]);
 // Companion extensions (installed via /ext setup)
 // ═══════════════════════════════════════════════════════════════════
 
+type CompanionGroup = "aiwayds" | "rpiv" | "ecosystem";
+type CompanionType = "pi" | "copy" | "check";
+
 interface Companion {
   label: string;
-  pkg: string;    // package name — used for "already installed" detection
-  source: string; // source passed to `pi install`
+  pkg: string; // detection package name (pi-type: used by isCompanionInstalled)
+  group: CompanionGroup; // display grouping: aiwayds / rpiv / ecosystem
+  type: CompanionType; // how to install: pi install | copy local files | probe CLI
+  source?: string; // type=pi: source passed to `pi install` (e.g. "npm:@scope/pkg")
+  copyFrom?: string[]; // type=copy: candidate source dirs (absolute), first existing wins
+  copyTo?: string; // type=copy: destination directory
+  files?: string[]; // type=copy: explicit file list; empty/omitted → auto-discover *.md
+  checkCmd?: string; // type=check: probe command (e.g. "command -v lean-ctx")
+  hint?: string; // type=check: install hint shown when the CLI is missing
 }
 
 const COMPANIONS: Record<string, Companion> = {
-  sidebar: { label: "Sidebar Panel", pkg: "@aiwayds/pi-sidebar-panel", source: "npm:@aiwayds/pi-sidebar-panel" },
-  footbar: { label: "Powerline Footer", pkg: "@aiwayds/pi-powerline-footer", source: "npm:@aiwayds/pi-powerline-footer" },
-  cron: { label: "Kimi Cron", pkg: "@aiwayds/pi-kimi-cron", source: "npm:@aiwayds/pi-kimi-cron" },
-  "think-panel": { label: "Think Panel", pkg: "@aiwayds/pi-think-panel", source: "npm:@aiwayds/pi-think-panel" },
-  bailian: { label: "Bailian Token Plan", pkg: "@aiwayds/pi-bailian-token-plan", source: "npm:@aiwayds/pi-bailian-token-plan" },
-  jarvis: { label: "Jarvis Sphere", pkg: "@aiwayds/pi-jarvis-sphere", source: "npm:@aiwayds/pi-jarvis-sphere" },
-  "model-favs": { label: "Model Favorites", pkg: "@aiwayds/pi-model-favorites", source: "npm:@aiwayds/pi-model-favorites" },
-  "topic-memory": { label: "Topic Memory", pkg: "@aiwayds/pi-topic-memory", source: "npm:@aiwayds/pi-topic-memory" },
-  "fun-agent": { label: "Fun Agent", pkg: "@aiwayds/pi-fun-agent", source: "npm:@aiwayds/pi-fun-agent" },
+  // ── aiwayds group (9) — pi install ───────────────────────────────
+  sidebar: {
+    label: "Sidebar Panel",
+    pkg: "@aiwayds/pi-sidebar-panel",
+    group: "aiwayds",
+    type: "pi",
+    source: "npm:@aiwayds/pi-sidebar-panel",
+  },
+  footbar: {
+    label: "Powerline Footer",
+    pkg: "@aiwayds/pi-powerline-footer",
+    group: "aiwayds",
+    type: "pi",
+    source: "npm:@aiwayds/pi-powerline-footer",
+  },
+  cron: {
+    label: "Kimi Cron",
+    pkg: "@aiwayds/pi-kimi-cron",
+    group: "aiwayds",
+    type: "pi",
+    source: "npm:@aiwayds/pi-kimi-cron",
+  },
+  "think-panel": {
+    label: "Think Panel",
+    pkg: "@aiwayds/pi-think-panel",
+    group: "aiwayds",
+    type: "pi",
+    source: "npm:@aiwayds/pi-think-panel",
+  },
+  bailian: {
+    label: "Bailian Token Plan",
+    pkg: "@aiwayds/pi-bailian-token-plan",
+    group: "aiwayds",
+    type: "pi",
+    source: "npm:@aiwayds/pi-bailian-token-plan",
+  },
+  jarvis: {
+    label: "Jarvis Sphere",
+    pkg: "@aiwayds/pi-jarvis-sphere",
+    group: "aiwayds",
+    type: "pi",
+    source: "npm:@aiwayds/pi-jarvis-sphere",
+  },
+  "model-favs": {
+    label: "Model Favorites",
+    pkg: "@aiwayds/pi-model-favorites",
+    group: "aiwayds",
+    type: "pi",
+    source: "npm:@aiwayds/pi-model-favorites",
+  },
+  "topic-memory": {
+    label: "Topic Memory",
+    pkg: "@aiwayds/pi-topic-memory",
+    group: "aiwayds",
+    type: "pi",
+    source: "npm:@aiwayds/pi-topic-memory",
+  },
+  "fun-agent": {
+    label: "Fun Agent",
+    pkg: "@aiwayds/pi-fun-agent",
+    group: "aiwayds",
+    type: "pi",
+    source: "npm:@aiwayds/pi-fun-agent",
+  },
+  // ── rpiv group (9) — pi install ──────────────────────────────────
+  "rpiv-pi": {
+    label: "RPIV Pi",
+    pkg: "@juicesharp/rpiv-pi",
+    group: "rpiv",
+    type: "pi",
+    source: "npm:@juicesharp/rpiv-pi",
+  },
+  "rpiv-workflow": {
+    label: "RPIV Workflow",
+    pkg: "@juicesharp/rpiv-workflow",
+    group: "rpiv",
+    type: "pi",
+    source: "npm:@juicesharp/rpiv-workflow",
+  },
+  "rpiv-ask-user-question": {
+    label: "RPIV Ask User Question",
+    pkg: "@juicesharp/rpiv-ask-user-question",
+    group: "rpiv",
+    type: "pi",
+    source: "npm:@juicesharp/rpiv-ask-user-question",
+  },
+  "rpiv-todo": {
+    label: "RPIV Todo",
+    pkg: "@juicesharp/rpiv-todo",
+    group: "rpiv",
+    type: "pi",
+    source: "npm:@juicesharp/rpiv-todo",
+  },
+  "rpiv-advisor": {
+    label: "RPIV Advisor",
+    pkg: "@juicesharp/rpiv-advisor",
+    group: "rpiv",
+    type: "pi",
+    source: "npm:@juicesharp/rpiv-advisor",
+  },
+  "rpiv-i18n": {
+    label: "RPIV i18n",
+    pkg: "@juicesharp/rpiv-i18n",
+    group: "rpiv",
+    type: "pi",
+    source: "npm:@juicesharp/rpiv-i18n",
+  },
+  "rpiv-web-tools": {
+    label: "RPIV Web Tools",
+    pkg: "@juicesharp/rpiv-web-tools",
+    group: "rpiv",
+    type: "pi",
+    source: "npm:@juicesharp/rpiv-web-tools",
+  },
+  "rpiv-args": {
+    label: "RPIV Args",
+    pkg: "@juicesharp/rpiv-args",
+    group: "rpiv",
+    type: "pi",
+    source: "npm:@juicesharp/rpiv-args",
+  },
+  "rpiv-btw": {
+    label: "RPIV By The Way",
+    pkg: "@juicesharp/rpiv-btw",
+    group: "rpiv",
+    type: "pi",
+    source: "npm:@juicesharp/rpiv-btw",
+  },
+  // ── ecosystem group (4) — pi / copy / check ──────────────────────
+  "lean-ctx": {
+    label: "lean-ctx (pi extension)",
+    pkg: "pi-lean-ctx",
+    group: "ecosystem",
+    type: "pi",
+    source: "npm:pi-lean-ctx",
+  },
+  "lean-ctx-cli": {
+    label: "lean-ctx CLI",
+    pkg: "lean-ctx-cli",
+    group: "ecosystem",
+    type: "check",
+    checkCmd: "command -v lean-ctx",
+    hint: "cargo install lean-ctx  # 或: brew tap yvgude/lean-ctx && brew install lean-ctx",
+  },
+  agents: {
+    label: "Agents (auto-sync)",
+    pkg: "agents",
+    group: "ecosystem",
+    type: "copy",
+    copyFrom: [
+      path.join(
+        os.homedir(),
+        ".pi",
+        "agent",
+        "npm",
+        "node_modules",
+        "@aiwayds",
+        "pi-fun-agent",
+        "agents",
+      ),
+      path.join(os.homedir(), "github", "fun-agent", "agents"),
+    ],
+    copyTo: path.join(os.homedir(), ".pi", "agent", "agents"),
+  },
+  "pi-subagents": {
+    label: "Subagents",
+    pkg: "@tintinweb/pi-subagents",
+    group: "ecosystem",
+    type: "pi",
+    source: "npm:@tintinweb/pi-subagents",
+  },
 };
 
 function settingsPackages(): string[] {
   try {
-    const cfg = JSON.parse(readFileSync(path.join(os.homedir(), ".pi", "agent", "settings.json"), "utf8"));
+    const cfg = JSON.parse(
+      readFileSync(
+        path.join(os.homedir(), ".pi", "agent", "settings.json"),
+        "utf8",
+      ),
+    );
     return Array.isArray(cfg?.packages) ? cfg.packages.map(String) : [];
-  } catch { /* settings.json missing/unreadable */ }
+  } catch {
+    /* settings.json missing/unreadable */
+  }
   return [];
 }
 
 function isCompanionInstalled(c: Companion): boolean {
-  // pi install writes to settings.json packages; local conventional dirs also count.
-  const pkgs = settingsPackages();
-  if (pkgs.some((p) => p.includes(c.pkg))) return true;
-  // Basename fallback: local-path registrations (e.g. "../../github/pi-model-favorites" or
-  // "../../github/fun-agent") don't contain the full scoped pkg name. Compare the bare package
-  // basename, tolerating a missing "pi-" prefix (local dir "fun-agent" vs pkg "pi-fun-agent").
-  const base = c.pkg.split("/").pop() ?? "";
-  const short = base.replace(/^pi-/, "");
-  if (pkgs.some((p) => p.includes(base) || p.includes(short))) return true;
-  if (existsSync(path.join(os.homedir(), ".pi", "agent", "extensions", c.pkg))) return true;
-  return false;
+  switch (c.type) {
+    case "check": {
+      // Probe CLI presence via checkCmd; never installs anything.
+      if (!c.checkCmd) return false;
+      try {
+        const r = spawnSync(c.checkCmd, {
+          shell: true,
+          stdio: "ignore",
+          timeout: 3_000,
+        });
+        return r.status === 0;
+      } catch {
+        return false;
+      }
+    }
+    case "copy": {
+      // Installed iff every expected agent file already exists in copyTo
+      // (protects local customizations — never overwrite existing files).
+      const target = c.copyTo;
+      if (!target || !existsSync(target)) return false;
+      const src = (c.copyFrom ?? []).find((d) => existsSync(d));
+      if (src) {
+        const want = agentFilesIn(src);
+        if (want.length === 0) return true; // nothing to sync → already satisfied
+        return want.every((f) => existsSync(path.join(target, f)));
+      }
+      // No known source (fun-agent not installed): any agent file present counts.
+      try {
+        return fs.readdirSync(target).some((f) => f.endsWith(".md"));
+      } catch {
+        return false;
+      }
+    }
+    default: {
+      // pi install writes to settings.json packages; local conventional dirs also count.
+      const pkgs = settingsPackages();
+      if (pkgs.some((p) => p.includes(c.pkg))) return true;
+      // Basename fallback: local-path registrations (e.g. "../../github/pi-model-favorites" or
+      // "../../github/fun-agent") don't contain the full scoped pkg name. Compare the bare package
+      // basename, tolerating a missing "pi-" prefix (local dir "fun-agent" vs pkg "pi-fun-agent").
+      const base = c.pkg.split("/").pop() ?? "";
+      const short = base.replace(/^pi-/, "");
+      if (pkgs.some((p) => p.includes(base) || p.includes(short))) return true;
+      if (existsSync(path.join(os.homedir(), ".pi", "agent", "extensions", c.pkg)))
+        return true;
+      return false;
+    }
+  }
+}
+
+/** Non-hidden, non-backup .md files in a directory (used to discover agent sources). */
+function agentFilesIn(dir: string): string[] {
+  try {
+    return fs
+      .readdirSync(dir)
+      .filter(
+        (f) => f.endsWith(".md") && !f.startsWith(".") && !f.includes(".bak"),
+      )
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
+const GROUP_ORDER: CompanionGroup[] = ["aiwayds", "rpiv", "ecosystem"];
+
+/** COMPANIONS entries in display order: grouped (aiwayds → rpiv → ecosystem), then insertion. */
+function orderedCompanions(): Array<[string, Companion]> {
+  return Object.entries(COMPANIONS).sort(
+    (a, b) => GROUP_ORDER.indexOf(a[1].group) - GROUP_ORDER.indexOf(b[1].group),
+  );
+}
+
+/** Detail suffix for picker/status rows: pi-type shows the npm pkg, others show the action type. */
+function companionDetail(c: Companion): string {
+  return c.type === "pi" ? c.pkg : `[${c.type}]`;
+}
+
+/**
+ * Copy companion agent files (fun-agent's agents/) into ~/.pi/agent/agents/.
+ * Probes copyFrom in order (first existing dir wins). A file is copied only
+ * when the target does NOT already exist — local customizations (e.g. a tuned
+ * oldfox.md) are never overwritten. Returns copy statistics.
+ */
+async function syncAgents(
+  c: Companion,
+  ctx: ExtensionContext,
+): Promise<{ copied: number; skipped: number; source?: string }> {
+  const src = (c.copyFrom ?? []).find((d) => existsSync(d));
+  if (!src) {
+    ctx.ui.notify(
+      `agents: no source dir found (${(c.copyFrom ?? []).join(", ")})`,
+      "warning",
+    );
+    return { copied: 0, skipped: 0 };
+  }
+  const target = c.copyTo;
+  if (!target) return { copied: 0, skipped: 0 };
+  fs.mkdirSync(target, { recursive: true });
+  const files = c.files && c.files.length > 0 ? c.files : agentFilesIn(src);
+  let copied = 0;
+  let skipped = 0;
+  for (const f of files) {
+    const from = path.join(src, f);
+    const to = path.join(target, f);
+    if (!existsSync(from)) {
+      skipped++; // listed but absent from source → skip
+      continue;
+    }
+    if (existsSync(to)) {
+      skipped++; // already present → never overwrite local customization
+      continue;
+    }
+    try {
+      fs.copyFileSync(from, to);
+      copied++;
+    } catch (e) {
+      ctx.ui.notify(`agents: copy ${f} failed — ${(e as Error).message}`, "error");
+    }
+  }
+  return { copied, skipped, source: src };
 }
 
 interface PickerItem {
@@ -114,7 +420,10 @@ class CompanionPicker {
   handleInput(data: string): void {
     if (matchesKey(data, Key.up) && this.cursor > 0) {
       this.cursor--;
-    } else if (matchesKey(data, Key.down) && this.cursor < this.items.length - 1) {
+    } else if (
+      matchesKey(data, Key.down) &&
+      this.cursor < this.items.length - 1
+    ) {
       this.cursor++;
     } else if (matchesKey(data, Key.space)) {
       const name = this.items[this.cursor].name;
@@ -124,7 +433,9 @@ class CompanionPicker {
       if (this.checked.size === this.items.length) this.checked.clear();
       else for (const it of this.items) this.checked.add(it.name);
     } else if (matchesKey(data, Key.enter)) {
-      this.onDone?.(this.items.map((it) => it.name).filter((n) => this.checked.has(n)));
+      this.onDone?.(
+        this.items.map((it) => it.name).filter((n) => this.checked.has(n)),
+      );
       return;
     } else if (matchesKey(data, Key.escape)) {
       this.onCancel?.();
@@ -138,14 +449,23 @@ class CompanionPicker {
   render(width: number, theme: Theme): string[] {
     if (this.cache && this.cache.width === width) return this.cache.lines;
     const lines: string[] = [
-      theme.bold(truncateToWidth("Install companions — space: toggle · a: all/none · enter: install · esc: cancel", width)),
+      theme.bold(
+        truncateToWidth(
+          "Install companions — space: toggle · a: all/none · enter: install · esc: cancel",
+          width,
+        ),
+      ),
       "",
     ];
     for (let i = 0; i < this.items.length; i++) {
       const it = this.items[i];
       const cursor = i === this.cursor ? theme.fg("accent", ">") : " ";
-      const box = this.checked.has(it.name) ? theme.fg("success", "[x]") : theme.fg("dim", "[ ]");
-      const label = it.installed ? theme.fg("dim", `${it.label} (installed)`) : it.label;
+      const box = this.checked.has(it.name)
+        ? theme.fg("success", "[x]")
+        : theme.fg("dim", "[ ]");
+      const label = it.installed
+        ? theme.fg("dim", `${it.label} (installed)`)
+        : it.label;
       lines.push(truncateToWidth(`${cursor} ${box} ${label}`, width));
     }
     this.cache = { width, lines };
@@ -158,9 +478,9 @@ class CompanionPicker {
 }
 
 async function pickCompanions(ctx: ExtensionContext): Promise<string[] | null> {
-  const items: PickerItem[] = Object.entries(COMPANIONS).map(([name, c]) => ({
+  const items: PickerItem[] = orderedCompanions().map(([name, c]) => ({
     name,
-    label: `${c.label} (${c.pkg})`,
+    label: `${c.label} (${companionDetail(c)})`,
     installed: isCompanionInstalled(c),
   }));
   return ctx.ui.custom<string[] | null>((tui, theme, _keybindings, done) => {
@@ -178,13 +498,23 @@ async function pickCompanions(ctx: ExtensionContext): Promise<string[] | null> {
   });
 }
 
-async function runSetup(pi: ExtensionAPI, ctx: ExtensionContext, names: string[], opts: { interactive?: boolean } = {}): Promise<void> {
+async function runSetup(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  names: string[],
+  opts: { interactive?: boolean } = {},
+): Promise<void> {
   const interactive = opts.interactive ?? true;
   const hasNames = names.length > 0;
-  const targets0 = hasNames ? names : Object.keys(COMPANIONS);
+  const targets0 = hasNames ? names : orderedCompanions().map(([n]) => n);
   const unknown = targets0.filter((n) => !COMPANIONS[n]);
   if (unknown.length > 0) {
-    ctx.ui.notify(`Unknown companion: ${unknown.join(", ")}. Available: ${Object.keys(COMPANIONS).join(", ")}`, "error");
+    ctx.ui.notify(
+      `Unknown companion: ${unknown.join(", ")}. Available: ${orderedCompanions()
+        .map(([n]) => n)
+        .join(", ")}`,
+      "error",
+    );
     return;
   }
   let targets = targets0;
@@ -201,21 +531,63 @@ async function runSetup(pi: ExtensionAPI, ctx: ExtensionContext, names: string[]
     }
   }
   const results: string[] = [];
-  for (const name of targets) {
+  const sel = new Set(targets);
+  const groupTag = (g: CompanionGroup) => `[${g}]`;
+  // Phase 1 — install every selected pi-type companion (existing logic).
+  // Run first so copy-type items (which need fun-agent's agents on disk) work.
+  for (const [name] of orderedCompanions()) {
     const c = COMPANIONS[name];
+    if (!sel.has(name) || c.type !== "pi") continue;
     if (isCompanionInstalled(c)) {
-      results.push(`  \u2705 ${c.label}: already installed`);
+      results.push(`  ${groupTag(c.group)} ✅ ${c.label}: already installed`);
       continue;
     }
     try {
-      const res = await pi.exec("pi", ["install", c.source], { cwd: process.cwd() });
-      const code = (res as { code?: number; status?: number } | null)?.code ?? (res as { status?: number } | null)?.status ?? 0;
-      results.push(code === 0 ? `  \u2705 ${c.label}: installed (${c.source})` : `  \u274c ${c.label}: pi install exited ${code}`);
+      const res = await pi.exec("pi", ["install", c.source!], {
+        cwd: process.cwd(),
+      });
+      const code =
+        (res as { code?: number; status?: number } | null)?.code ??
+        (res as { status?: number } | null)?.status ??
+        0;
+      results.push(
+        code === 0
+          ? `  ${groupTag(c.group)} ✅ ${c.label}: installed (${c.source})`
+          : `  ${groupTag(c.group)} ❌ ${c.label}: pi install exited ${code}`,
+      );
     } catch (e) {
-      results.push(`  \u274c ${c.label}: FAILED — ${(e as Error).message}`);
+      results.push(`  ${groupTag(c.group)} ❌ ${c.label}: FAILED — ${(e as Error).message}`);
     }
   }
-  ctx.ui.notify(`Setup:\n${results.join("\n")}\nReload pi (/reload) to activate new extensions`, "info");
+  // Phase 2 — copy-type: sync fun-agent agents (idempotent, skips existing files).
+  for (const [name] of orderedCompanions()) {
+    const c = COMPANIONS[name];
+    if (!sel.has(name) || c.type !== "copy") continue;
+    const r = await syncAgents(c, ctx);
+    if (r.source) {
+      results.push(
+        `  ${groupTag(c.group)} ${r.copied > 0 ? "✅" : "ℹ️"} ${c.label}: synced (copied ${r.copied}, skipped ${r.skipped})`,
+      );
+    } else {
+      results.push(`  ${groupTag(c.group)} ❌ ${c.label}: no source dir found`);
+    }
+  }
+  // Phase 3 — check-type: probe CLI presence; only report a hint, never install.
+  for (const [name] of orderedCompanions()) {
+    const c = COMPANIONS[name];
+    if (!sel.has(name) || c.type !== "check") continue;
+    if (isCompanionInstalled(c)) {
+      results.push(`  ${groupTag(c.group)} ✅ ${c.label}: found`);
+    } else {
+      results.push(
+        `  ${groupTag(c.group)} ❌ ${c.label}: missing — install: ${c.hint ?? "see package docs"}`,
+      );
+    }
+  }
+  ctx.ui.notify(
+    `Setup:\n${results.join("\n")}\nReload pi (/reload) to activate new extensions`,
+    "info",
+  );
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -234,7 +606,9 @@ function getBuiltinAgentNames(): string[] {
       for (const entry of fs.readdirSync(dir)) {
         if (entry.endsWith(".md")) names.add(entry.replace(".md", ""));
       }
-    } catch { /* dir doesn't exist */ }
+    } catch {
+      /* dir doesn't exist */
+    }
   }
   return [...names].sort();
 }
@@ -261,20 +635,36 @@ function registerAtAgent(pi: ExtensionAPI): void {
         const line = lines[cursorLine] ?? "";
         const beforeCursor = line.slice(0, cursorCol);
         const match = beforeCursor.match(/(?:^|[ \t])@([^\s@]*)$/);
-        if (!match) return current.getSuggestions(lines, cursorLine, cursorCol, options);
+        if (!match)
+          return current.getSuggestions(lines, cursorLine, cursorCol, options);
         const prefix = match[1] ?? "";
         const agents = getBuiltinAgentNames();
-        const filtered = agents.filter((a) => a.startsWith(prefix.toLowerCase()));
+        const filtered = agents.filter((a) =>
+          a.startsWith(prefix.toLowerCase()),
+        );
         return {
           prefix: `@${prefix}`,
-          items: filtered.map((a) => ({ value: `@${a}`, label: `@${a}`, description: `Run ${a} subagent` })),
+          items: filtered.map((a) => ({
+            value: `@${a}`,
+            label: `@${a}`,
+            description: `Run ${a} subagent`,
+          })),
         };
       },
       applyCompletion(lines, cursorLine, cursorCol, item, prefix) {
-        return current.applyCompletion(lines, cursorLine, cursorCol, item, prefix);
+        return current.applyCompletion(
+          lines,
+          cursorLine,
+          cursorCol,
+          item,
+          prefix,
+        );
       },
       shouldTriggerFileCompletion(lines, cursorLine, cursorCol) {
-        return current.shouldTriggerFileCompletion?.(lines, cursorLine, cursorCol) ?? true;
+        return (
+          current.shouldTriggerFileCompletion?.(lines, cursorLine, cursorCol) ??
+          true
+        );
       },
     }));
   });
@@ -286,16 +676,24 @@ function registerAtAgent(pi: ExtensionAPI): void {
 
 function registerExtCommand(pi: ExtensionAPI): void {
   pi.registerCommand("ext", {
-    description: "Toggle at-agent, show status, or install companion extensions (setup)",
+    description:
+      "Toggle at-agent, show status, or install companion extensions (setup)",
     handler: async (args: string, ctx) => {
       const trimmed = args?.trim() || "";
       const parts = trimmed.split(/\s+/);
       const cmd = parts[0];
 
       if (cmd === "status") {
-        const lines = [`at-agent: ${state.atAgent ? "\u2705" : "\u274c"}`, "Companions:"];
-        for (const [name, c] of Object.entries(COMPANIONS)) {
-          lines.push(`  ${isCompanionInstalled(c) ? "\u2705" : "\u274c"} ${name} (${c.pkg})`);
+        const lines = [`at-agent: ${state.atAgent ? "\u2705" : "\u274c"}`];
+        let currentGroup: CompanionGroup | "" = "";
+        for (const [name, c] of orderedCompanions()) {
+          if (c.group !== currentGroup) {
+            currentGroup = c.group;
+            lines.push(`${currentGroup}:`);
+          }
+          lines.push(
+            `  ${isCompanionInstalled(c) ? "\u2705" : "\u274c"} ${name} (${companionDetail(c)})`,
+          );
         }
         ctx.ui.notify(lines.join("\n"), "info");
         return;
@@ -334,14 +732,20 @@ function registerExtCommand(pi: ExtensionAPI): void {
           ctx.ui.notify("at-agent disabled", "warning");
         } else {
           state.atAgent = !state.atAgent;
-          ctx.ui.notify(`at-agent ${state.atAgent ? "enabled" : "disabled"}`, state.atAgent ? "info" : "warning");
+          ctx.ui.notify(
+            `at-agent ${state.atAgent ? "enabled" : "disabled"}`,
+            state.atAgent ? "info" : "warning",
+          );
         }
         return;
       }
 
       // bare /ext toggles at-agent
       state.atAgent = !state.atAgent;
-      ctx.ui.notify(`at-agent ${state.atAgent ? "enabled" : "disabled"}`, state.atAgent ? "info" : "warning");
+      ctx.ui.notify(
+        `at-agent ${state.atAgent ? "enabled" : "disabled"}`,
+        state.atAgent ? "info" : "warning",
+      );
     },
   });
 }
@@ -357,8 +761,13 @@ function registerSkillShortcuts(pi: ExtensionAPI): void {
     (skill: string) =>
     async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
       const trimmed = args?.trim() ?? "";
-      ctx.ui.notify(`Launching /skill:${skill}${trimmed ? ` — ${trimmed}` : ""}`, "info");
-      await pi.sendUserMessage(`/skill:${skill}${trimmed ? ` ${trimmed}` : ""}`);
+      ctx.ui.notify(
+        `Launching /skill:${skill}${trimmed ? ` — ${trimmed}` : ""}`,
+        "info",
+      );
+      await pi.sendUserMessage(
+        `/skill:${skill}${trimmed ? ` ${trimmed}` : ""}`,
+      );
     };
 
   pi.registerCommand("init", {
@@ -367,7 +776,8 @@ function registerSkillShortcuts(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("init-deep", {
-    description: "Generate .architect/**/architecture.md shadow tree (per-layer guidance)",
+    description:
+      "Generate .architect/**/architecture.md shadow tree (per-layer guidance)",
     handler: forward("init-deep"),
   });
 }
@@ -376,9 +786,17 @@ function registerSkillShortcuts(pi: ExtensionAPI): void {
 // /think command handler - cycle through thinking levels
 // ═══════════════════════════════════════════════════════════════════
 
-const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+const THINKING_LEVELS = [
+  "off",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+] as const;
 
-type ThinkingLevel = typeof THINKING_LEVELS[number];
+type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
 function registerThinkCommand(pi: ExtensionAPI): void {
   pi.registerCommand("think", {
@@ -393,7 +811,10 @@ function registerThinkCommand(pi: ExtensionAPI): void {
           pi.setThinkingLevel(level);
           ctx.ui.notify(`Thinking level: ${level}`, "info");
         } else {
-          ctx.ui.notify(`Invalid level: ${trimmed}. Available: ${THINKING_LEVELS.join(", ")}`, "error");
+          ctx.ui.notify(
+            `Invalid level: ${trimmed}. Available: ${THINKING_LEVELS.join(", ")}`,
+            "error",
+          );
         }
         return;
       }
@@ -436,22 +857,34 @@ interface TurboTimingsFile {
 function readLastTurboRun(): TurboStatsData | null {
   try {
     if (!existsSync(TURBO_TIMINGS_FILE)) return null;
-    const data = JSON.parse(readFileSync(TURBO_TIMINGS_FILE, "utf8")) as TurboTimingsFile;
+    const data = JSON.parse(
+      readFileSync(TURBO_TIMINGS_FILE, "utf8"),
+    ) as TurboTimingsFile;
     const history = Array.isArray(data?.history) ? data.history : [];
     const last = history[history.length - 1];
     if (!last?.ts) return null;
     const ts = Date.parse(last.ts);
-    if (!Number.isFinite(ts) || Date.now() - ts > TURBO_FRESHNESS_MS) return null;
+    if (!Number.isFinite(ts) || Date.now() - ts > TURBO_FRESHNESS_MS)
+      return null;
     const extensions = Number(last.n) || 0;
     const loadMs = Number(last.ms) || 0;
     if (extensions === 0 || loadMs === 0) return null;
-    return { extensions, loadMs, emaMs: Number(data.ema) || loadMs, ...readTurboSaved() };
+    return {
+      extensions,
+      loadMs,
+      emaMs: Number(data.ema) || loadMs,
+      ...readTurboSaved(),
+    };
   } catch {
     return null; // missing/unreadable/corrupt → skip silently
   }
 }
 
-const TURBO_LAST_RUN_FILE = path.join(os.homedir(), ".pi-turbo", "last-run.json");
+const TURBO_LAST_RUN_FILE = path.join(
+  os.homedir(),
+  ".pi-turbo",
+  "last-run.json",
+);
 
 /** Read this boot's acceleration stats (saved ms + %) from last-run.json. */
 function readTurboSaved(): { savedMs: number; pct: number } {
@@ -466,9 +899,11 @@ function readTurboSaved(): { savedMs: number; pct: number } {
     };
     if (!data?.ts) return { savedMs: 0, pct: 0 };
     const ts = Date.parse(data.ts);
-    if (!Number.isFinite(ts) || Date.now() - ts > TURBO_FRESHNESS_MS) return { savedMs: 0, pct: 0 };
+    if (!Number.isFinite(ts) || Date.now() - ts > TURBO_FRESHNESS_MS)
+      return { savedMs: 0, pct: 0 };
     const savedMs = Number(data.savedMs) || 0;
-    if (data.profiling || data.serial || savedMs <= 0) return { savedMs: 0, pct: 0 };
+    if (data.profiling || data.serial || savedMs <= 0)
+      return { savedMs: 0, pct: 0 };
     return { savedMs, pct: Number(data.pct) || 0 };
   } catch {
     return { savedMs: 0, pct: 0 }; // missing/unreadable/corrupt → no saved stats
@@ -476,20 +911,25 @@ function readTurboSaved(): { savedMs: number; pct: number } {
 }
 
 function registerPiTurboStats(pi: ExtensionAPI): void {
-  pi.registerEntryRenderer<TurboStatsData>("pi-turbo-stats", (entry, _opts, theme) => {
-    const d = entry.data;
-    if (!d) return undefined;
-    const box = new Container();
-    box.addChild(new DynamicBorder((t) => theme.fg("accent", t)));
-    const body =
-      `${theme.bold(theme.fg("accent", "⚡ pi-turbo"))}\n` +
-      `${theme.fg("muted", `${d.extensions} extensions loaded in `)}${d.loadMs}ms` +
-      `${theme.fg("muted", ` · EMA ${d.emaMs}ms`)}` +
-      (d.savedMs ? `${theme.fg("muted", ` · saved `)}${d.savedMs}ms (${d.pct ?? 0}%)` : "");
-    box.addChild(new Text(body, 1, 0));
-    box.addChild(new DynamicBorder((t) => theme.fg("accent", t)));
-    return box;
-  });
+  pi.registerEntryRenderer<TurboStatsData>(
+    "pi-turbo-stats",
+    (entry, _opts, theme) => {
+      const d = entry.data;
+      if (!d) return undefined;
+      const box = new Container();
+      box.addChild(new DynamicBorder((t) => theme.fg("accent", t)));
+      const body =
+        `${theme.bold(theme.fg("accent", "⚡ pi-turbo"))}\n` +
+        `${theme.fg("muted", `${d.extensions} extensions loaded in `)}${d.loadMs}ms` +
+        `${theme.fg("muted", ` · EMA ${d.emaMs}ms`)}` +
+        (d.savedMs
+          ? `${theme.fg("muted", ` · saved `)}${d.savedMs}ms (${d.pct ?? 0}%)`
+          : "");
+      box.addChild(new Text(body, 1, 0));
+      box.addChild(new DynamicBorder((t) => theme.fg("accent", t)));
+      return box;
+    },
+  );
 
   pi.on("session_start", (event) => {
     if (event.reason !== "startup") return;
