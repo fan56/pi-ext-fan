@@ -1,8 +1,9 @@
 /**
- * pi-ext-fan — @agent interception + companion extension installer
+ * pi-ext-fan — @agent interception + family-bucket companion installer
  *
  * Kept features:
  *   1. at-agent  — @agent syntax interception + autocomplete
+ *   2. companions — 9-item family-bucket list (all npm: sources) installed via /ext
  *
  * Removed (replaced by standalone extensions):
  *   - sidebar      → @aiwayds/pi-sidebar-panel  (/sidebar command)
@@ -12,12 +13,13 @@
  * Commands:
  *   /ext                — toggle at-agent on/off
  *   /ext status         — at-agent state + companion install status
+ *   /ext all            — one-shot install of every missing companion (no picker, skips installed)
  *   /ext setup          — interactive picker (all selected by default) → install chosen companions
  *   /ext setup <name>   — install one companion
  *   /think              — cycle/set thinking level
  */
 
-import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, Theme, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { matchesKey, Key, truncateToWidth, Container, Text } from "@earendil-works/pi-tui";
 import * as fs from "node:fs";
@@ -54,10 +56,13 @@ interface Companion {
 const COMPANIONS: Record<string, Companion> = {
   sidebar: { label: "Sidebar Panel", pkg: "@aiwayds/pi-sidebar-panel", source: "npm:@aiwayds/pi-sidebar-panel" },
   footbar: { label: "Powerline Footer", pkg: "@aiwayds/pi-powerline-footer", source: "npm:@aiwayds/pi-powerline-footer" },
-  cron: { label: "Kimi Cron", pkg: "pi-kimi-cron", source: "npm:@aiwayds/pi-kimi-cron" },
-  "fun-agents": { label: "Fun Agents", pkg: "fun-agent", source: "../../github/fun-agent" },
+  cron: { label: "Kimi Cron", pkg: "@aiwayds/pi-kimi-cron", source: "npm:@aiwayds/pi-kimi-cron" },
   "think-panel": { label: "Think Panel", pkg: "@aiwayds/pi-think-panel", source: "npm:@aiwayds/pi-think-panel" },
   bailian: { label: "Bailian Token Plan", pkg: "@aiwayds/pi-bailian-token-plan", source: "npm:@aiwayds/pi-bailian-token-plan" },
+  jarvis: { label: "Jarvis Sphere", pkg: "@aiwayds/pi-jarvis-sphere", source: "npm:@aiwayds/pi-jarvis-sphere" },
+  "model-favs": { label: "Model Favorites", pkg: "@aiwayds/pi-model-favorites", source: "npm:@aiwayds/pi-model-favorites" },
+  "topic-memory": { label: "Topic Memory", pkg: "@aiwayds/pi-topic-memory", source: "npm:@aiwayds/pi-topic-memory" },
+  "fun-agent": { label: "Fun Agent", pkg: "@aiwayds/pi-fun-agent", source: "npm:@aiwayds/pi-fun-agent" },
 };
 
 function settingsPackages(): string[] {
@@ -70,7 +75,14 @@ function settingsPackages(): string[] {
 
 function isCompanionInstalled(c: Companion): boolean {
   // pi install writes to settings.json packages; local conventional dirs also count.
-  if (settingsPackages().some((p) => p.includes(c.pkg))) return true;
+  const pkgs = settingsPackages();
+  if (pkgs.some((p) => p.includes(c.pkg))) return true;
+  // Basename fallback: local-path registrations (e.g. "../../github/pi-model-favorites" or
+  // "../../github/fun-agent") don't contain the full scoped pkg name. Compare the bare package
+  // basename, tolerating a missing "pi-" prefix (local dir "fun-agent" vs pkg "pi-fun-agent").
+  const base = c.pkg.split("/").pop() ?? "";
+  const short = base.replace(/^pi-/, "");
+  if (pkgs.some((p) => p.includes(base) || p.includes(short))) return true;
   if (existsSync(path.join(os.homedir(), ".pi", "agent", "extensions", c.pkg))) return true;
   return false;
 }
@@ -166,7 +178,8 @@ async function pickCompanions(ctx: ExtensionContext): Promise<string[] | null> {
   });
 }
 
-async function runSetup(pi: ExtensionAPI, ctx: ExtensionContext, names: string[]): Promise<void> {
+async function runSetup(pi: ExtensionAPI, ctx: ExtensionContext, names: string[], opts: { interactive?: boolean } = {}): Promise<void> {
+  const interactive = opts.interactive ?? true;
   const hasNames = names.length > 0;
   const targets0 = hasNames ? names : Object.keys(COMPANIONS);
   const unknown = targets0.filter((n) => !COMPANIONS[n]);
@@ -175,7 +188,7 @@ async function runSetup(pi: ExtensionAPI, ctx: ExtensionContext, names: string[]
     return;
   }
   let targets = targets0;
-  if (!hasNames) {
+  if (!hasNames && interactive) {
     const picked = await pickCompanions(ctx);
     if (picked === null) {
       ctx.ui.notify("Setup cancelled", "info");
@@ -293,9 +306,15 @@ function registerExtCommand(pi: ExtensionAPI): void {
         return;
       }
 
+      if (cmd === "all") {
+        // One-shot family install: every missing companion, no picker, no prompts.
+        await runSetup(pi, ctx, [], { interactive: false });
+        return;
+      }
+
       if (cmd === "on") {
         state.atAgent = true;
-        ctx.ui.notify("at-agent enabled", "success");
+        ctx.ui.notify("at-agent enabled", "info");
         return;
       }
 
@@ -309,20 +328,20 @@ function registerExtCommand(pi: ExtensionAPI): void {
         const action = parts[1];
         if (action === "on") {
           state.atAgent = true;
-          ctx.ui.notify("at-agent enabled", "success");
+          ctx.ui.notify("at-agent enabled", "info");
         } else if (action === "off") {
           state.atAgent = false;
           ctx.ui.notify("at-agent disabled", "warning");
         } else {
           state.atAgent = !state.atAgent;
-          ctx.ui.notify(`at-agent ${state.atAgent ? "enabled" : "disabled"}`, state.atAgent ? "success" : "warning");
+          ctx.ui.notify(`at-agent ${state.atAgent ? "enabled" : "disabled"}`, state.atAgent ? "info" : "warning");
         }
         return;
       }
 
       // bare /ext toggles at-agent
       state.atAgent = !state.atAgent;
-      ctx.ui.notify(`at-agent ${state.atAgent ? "enabled" : "disabled"}`, state.atAgent ? "success" : "warning");
+      ctx.ui.notify(`at-agent ${state.atAgent ? "enabled" : "disabled"}`, state.atAgent ? "info" : "warning");
     },
   });
 }
@@ -336,7 +355,7 @@ function registerExtCommand(pi: ExtensionAPI): void {
 function registerSkillShortcuts(pi: ExtensionAPI): void {
   const forward =
     (skill: string) =>
-    async (args: string, ctx): Promise<void> => {
+    async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
       const trimmed = args?.trim() ?? "";
       ctx.ui.notify(`Launching /skill:${skill}${trimmed ? ` — ${trimmed}` : ""}`, "info");
       await pi.sendUserMessage(`/skill:${skill}${trimmed ? ` ${trimmed}` : ""}`);
@@ -372,7 +391,7 @@ function registerThinkCommand(pi: ExtensionAPI): void {
         const level = trimmed.toLowerCase() as ThinkingLevel;
         if (THINKING_LEVELS.includes(level)) {
           pi.setThinkingLevel(level);
-          ctx.ui.notify(`Thinking level: ${level}`, "success");
+          ctx.ui.notify(`Thinking level: ${level}`, "info");
         } else {
           ctx.ui.notify(`Invalid level: ${trimmed}. Available: ${THINKING_LEVELS.join(", ")}`, "error");
         }
@@ -386,7 +405,7 @@ function registerThinkCommand(pi: ExtensionAPI): void {
       const nextLevel = THINKING_LEVELS[nextIndex];
 
       pi.setThinkingLevel(nextLevel);
-      ctx.ui.notify(`Thinking level: ${nextLevel}`, "success");
+      ctx.ui.notify(`Thinking level: ${nextLevel}`, "info");
     },
   });
 }
@@ -437,7 +456,7 @@ const TURBO_LAST_RUN_FILE = path.join(os.homedir(), ".pi-turbo", "last-run.json"
 /** Read this boot's acceleration stats (saved ms + %) from last-run.json. */
 function readTurboSaved(): { savedMs: number; pct: number } {
   try {
-    if (!existsSync(TURBO_LAST_RUN_FILE)) return {};
+    if (!existsSync(TURBO_LAST_RUN_FILE)) return { savedMs: 0, pct: 0 };
     const data = JSON.parse(readFileSync(TURBO_LAST_RUN_FILE, "utf8")) as {
       ts?: string;
       savedMs?: number;
@@ -445,14 +464,14 @@ function readTurboSaved(): { savedMs: number; pct: number } {
       profiling?: boolean;
       serial?: boolean;
     };
-    if (!data?.ts) return {};
+    if (!data?.ts) return { savedMs: 0, pct: 0 };
     const ts = Date.parse(data.ts);
-    if (!Number.isFinite(ts) || Date.now() - ts > TURBO_FRESHNESS_MS) return {};
+    if (!Number.isFinite(ts) || Date.now() - ts > TURBO_FRESHNESS_MS) return { savedMs: 0, pct: 0 };
     const savedMs = Number(data.savedMs) || 0;
-    if (data.profiling || data.serial || savedMs <= 0) return {};
+    if (data.profiling || data.serial || savedMs <= 0) return { savedMs: 0, pct: 0 };
     return { savedMs, pct: Number(data.pct) || 0 };
   } catch {
-    return {}; // missing/unreadable/corrupt → no saved stats
+    return { savedMs: 0, pct: 0 }; // missing/unreadable/corrupt → no saved stats
   }
 }
 

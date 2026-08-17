@@ -1,7 +1,7 @@
 {
   "name": "@aiwayds/pi-ext-fan",
-  "version": "0.1.0",
-  "description": "pi-coding-agent extension — @agent interception, /ext companion installer (interactive picker), /think command, /init shortcuts",
+  "version": "0.1.1",
+  "description": "pi-coding-agent extension — @agent interception, /ext family-bucket installer (/ext all, /ext setup, /ext status), /think command, /init shortcuts",
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -13,6 +13,9 @@
   "license": "MIT",
   "author": "fan56",
   "main": "index.ts",
+  "pi": {
+    "extensions": ["index.ts"]
+  },
   "files": [
     "index.ts",
     "README.md",
@@ -30,13 +33,15 @@
     "@earendil-works/pi-tui": "*"
   },
   "devDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
     "jiti": "^2.4.0",
     "typescript": "^5.6.0",
     "@types/node": "^22.0.0"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "smoke": "node smoke-test.cjs"
   },
   "engines": {
     "node": ">=18"
