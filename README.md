@@ -14,7 +14,7 @@ Type `@<agent-name> <task>` in the input box to dispatch to a sub-agent:
 
 ### 2. Family-bucket installer (`/ext all` / `/ext setup`)
 
-The family bucket covers **22 companions in 3 groups**. Each entry is one of
+The family bucket covers **18 companions in 3 groups**. Each entry is one of
 three action types:
 
 - **`pi`** — installed via `pi install <source>` (tracked to `latest`)
@@ -38,18 +38,14 @@ three action types:
 | `topic-memory` | Topic Memory | `npm:@aiwayds/pi-topic-memory` |
 | `fun-agent` | Fun Agent | `npm:@aiwayds/pi-fun-agent` |
 
-#### `rpiv` group (9, all `pi`)
+#### `rpiv` group (5, all `pi`)
 
 | Key | Label | Source |
 | ----- | ------- | -------- |
-| `rpiv-pi` | RPIV Pi | `npm:@juicesharp/rpiv-pi` |
-| `rpiv-workflow` | RPIV Workflow | `npm:@juicesharp/rpiv-workflow` |
 | `rpiv-ask-user-question` | RPIV Ask User Question | `npm:@juicesharp/rpiv-ask-user-question` |
 | `rpiv-todo` | RPIV Todo | `npm:@juicesharp/rpiv-todo` |
 | `rpiv-advisor` | RPIV Advisor | `npm:@juicesharp/rpiv-advisor` |
 | `rpiv-i18n` | RPIV i18n | `npm:@juicesharp/rpiv-i18n` |
-| `rpiv-web-tools` | RPIV Web Tools | `npm:@juicesharp/rpiv-web-tools` |
-| `rpiv-args` | RPIV Args | `npm:@juicesharp/rpiv-args` |
 | `rpiv-btw` | RPIV By The Way | `npm:@juicesharp/rpiv-btw` |
 
 #### `ecosystem` group (4)

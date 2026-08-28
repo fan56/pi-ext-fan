@@ -3,7 +3,7 @@
  *
  * Kept features:
  *   1. at-agent  — @agent syntax interception + autocomplete
- *   2. companions — 22-item family bucket in 3 groups (aiwayds / rpiv / ecosystem),
+ *   2. companions — 18-item family bucket in 3 groups (aiwayds / rpiv / ecosystem),
  *      each entry having one of three action types:
  *        - pi    : installed via `pi install <source>` (npm:@...)
  *        - copy  : local files synced into ~/.pi/agent/agents (fun-agent agents,
@@ -145,21 +145,7 @@ const COMPANIONS: Record<string, Companion> = {
     type: "pi",
     source: "npm:@aiwayds/pi-fun-agent",
   },
-  // ── rpiv group (9) — pi install ──────────────────────────────────
-  "rpiv-pi": {
-    label: "RPIV Pi",
-    pkg: "@juicesharp/rpiv-pi",
-    group: "rpiv",
-    type: "pi",
-    source: "npm:@juicesharp/rpiv-pi",
-  },
-  "rpiv-workflow": {
-    label: "RPIV Workflow",
-    pkg: "@juicesharp/rpiv-workflow",
-    group: "rpiv",
-    type: "pi",
-    source: "npm:@juicesharp/rpiv-workflow",
-  },
+  // ── rpiv group (5) — pi install ──────────────────────────────────
   "rpiv-ask-user-question": {
     label: "RPIV Ask User Question",
     pkg: "@juicesharp/rpiv-ask-user-question",
@@ -187,20 +173,6 @@ const COMPANIONS: Record<string, Companion> = {
     group: "rpiv",
     type: "pi",
     source: "npm:@juicesharp/rpiv-i18n",
-  },
-  "rpiv-web-tools": {
-    label: "RPIV Web Tools",
-    pkg: "@juicesharp/rpiv-web-tools",
-    group: "rpiv",
-    type: "pi",
-    source: "npm:@juicesharp/rpiv-web-tools",
-  },
-  "rpiv-args": {
-    label: "RPIV Args",
-    pkg: "@juicesharp/rpiv-args",
-    group: "rpiv",
-    type: "pi",
-    source: "npm:@juicesharp/rpiv-args",
   },
   "rpiv-btw": {
     label: "RPIV By The Way",
@@ -313,7 +285,9 @@ function isCompanionInstalled(c: Companion): boolean {
       const base = c.pkg.split("/").pop() ?? "";
       const short = base.replace(/^pi-/, "");
       if (pkgs.some((p) => p.includes(base) || p.includes(short))) return true;
-      if (existsSync(path.join(os.homedir(), ".pi", "agent", "extensions", c.pkg)))
+      if (
+        existsSync(path.join(os.homedir(), ".pi", "agent", "extensions", c.pkg))
+      )
         return true;
       return false;
     }
@@ -387,7 +361,10 @@ async function syncAgents(
       fs.copyFileSync(from, to);
       copied++;
     } catch (e) {
-      ctx.ui.notify(`agents: copy ${f} failed — ${(e as Error).message}`, "error");
+      ctx.ui.notify(
+        `agents: copy ${f} failed — ${(e as Error).message}`,
+        "error",
+      );
     }
   }
   return { copied, skipped, source: src };
@@ -556,7 +533,9 @@ async function runSetup(
           : `  ${groupTag(c.group)} ❌ ${c.label}: pi install exited ${code}`,
       );
     } catch (e) {
-      results.push(`  ${groupTag(c.group)} ❌ ${c.label}: FAILED — ${(e as Error).message}`);
+      results.push(
+        `  ${groupTag(c.group)} ❌ ${c.label}: FAILED — ${(e as Error).message}`,
+      );
     }
   }
   // Phase 2 — copy-type: sync fun-agent agents (idempotent, skips existing files).

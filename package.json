@@ -1,6 +1,6 @@
 {
   "name": "@aiwayds/pi-ext-fan",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "pi-coding-agent extension — @agent interception, /ext family-bucket installer (/ext all, /ext setup, /ext status), /think command, /init shortcuts",
   "keywords": [
     "pi-package",
