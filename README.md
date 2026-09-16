@@ -191,6 +191,27 @@ Prefer a manual pick? Use `/ext setup` (interactive checkbox list) or
 `/ext setup <name>` for a single package. Check what's present with
 `/ext status` (or its `list` / `ls` aliases).
 
+## Release
+
+**Publishing flow.** Push a `v*` tag to trigger GitHub Actions, which runs
+`npm publish --provenance` automatically. A post-publish verify step then
+polls the npm registry for several minutes (≈5 min window) to confirm the
+new version is actually visible — npm propagation can lag, and this guard
+turns a late-arriving red status into green before downstream consumers
+pick the build up.
+
+**Token rotation.** The repository secret `NPM_TOKEN` and the maintainer's
+local `~/.npmrc` currently point at the same npm token. When rotating,
+update **both** in lockstep; rotating only one side leaves publishes
+authenticated against a stale credential and fails with `E401`.
+
+**Local development.** pi installs this package from the published npm
+version (`npm:@aiwayds/pi-ext-fan`), so edits inside this repo do **not**
+take effect immediately in a running session. To try local changes, install
+the absolute path of this checkout instead (e.g.
+`pi install /Users/fliu56/github/pi-ext-fan`), validate, then switch back
+to the npm source for everyday use.
+
 ## License
 
 MIT
