@@ -10,9 +10,32 @@ Type `@<agent-name> <task>` in the input box to dispatch to a sub-agent:
 
 - `@workhorse "write the tests"` → transforms into `/run workhorse "write the tests"`
 - Autocomplete for agent names on `@` (from built-in + `~/.pi/agent/agents` + `~/.agents`)
-- Toggle with `/ext on` / `/ext off` (bare `/ext` toggles)
+- Toggle with `/ext on` / `/ext off` (or `/ext at-agent [on|off]`)
 
-### 2. Family-bucket installer (`/ext all` / `/ext setup`)
+### 2. `/ext` command surface
+
+Bare `/ext` (or `/ext help`) prints the subcommand summary:
+
+```
+/ext commands:
+  help                                  show this help
+  status | list | ls                    at-agent state + companion install status
+  install-all                           install every companion in dependency order
+  setup [name ...]                      interactive picker (or run named companions)
+  on | off                              enable / disable @agent interception
+  at-agent [on|off]                     toggle (default) or set @agent interception
+```
+
+- `/ext status` (alias: `/ext list`, `/ext ls`) — at-agent state + companion
+  install status, **grouped by `aiwayds` / `rpiv` / `ecosystem`** with per-line
+  ✅/❌. The three names share a single handler, so output is identical.
+- `/ext on` / `/ext off` — enable / disable `@agent` interception directly.
+- `/ext at-agent [on|off]` — alias-set (`at-agent` / `at_agent` / `atagent`)
+  that accepts an optional `on` / `off` argument, defaulting to a toggle.
+- Unknown subcommands print the help text plus a one-line error pointing at
+  `/ext help` — no silent no-op, no crash.
+
+### 3. Family-bucket installer (`/ext install-all` / `/ext setup`)
 
 The family bucket covers **18 companions in 3 groups**. Each entry is one of
 three action types:
@@ -57,19 +80,51 @@ three action types:
 | `agents` | Agents (auto-sync) | `copy` | syncs fun-agent's `agents/*.md` → `~/.pi/agent/agents/` (skip-if-exists) |
 | `pi-subagents` | Subagents | `pi` | `npm:@tintinweb/pi-subagents` |
 
-`/ext all` runs the three phases in dependency order: **all `pi` installs first**, then the `copy` sync (depends on fun-agent's agents being on disk), then the `check` probes. The summary reports each group separately.
+Both `/ext install-all` and `/ext setup` share the same sequential runner.
+Items execute in strict dependency order — **all `pi` installs first**, then
+the `copy` sync (depends on fun-agent's agents being on disk), then the
+`check` probes — and within each phase the list order is preserved (never
+concurrent).
 
-- `/ext all` — **one-shot setup**: installs every missing `pi`-type companion, re-syncs `agents` (idempotent, skips existing files), probes the CLI checks. No picker, no prompts.
-- `/ext setup` — interactive checkbox picker (all selected by default, grouped): space toggles a row, `a` selects all/none, enter runs the checked ones, esc cancels.
-- `/ext setup <name> [<name>...]` — run named companions directly.
-- `/ext status` — at-agent state + companion install status, **grouped by `aiwayds` / `rpiv` / `ecosystem`** with per-line ✅/❌.
+Per-item progress is rendered in an editor widget above the input, updated
+in place after each item. The widget shows a 1-line counter header (e.g.
+`Installing 12/18 · installed=5 skipped=3 failed=1`) followed by the **last 9
+lines** — the most recent results plus the current in-progress row. Older
+results scroll off the top as the run continues; the full list and a final
+`Done.` summary arrive in the notify once the run completes.
 
-### 3. `/think` — cycle/set thinking level
+Line shapes:
+
+- `[3/18] Sidebar Panel …` — starting
+- `[3/18] Sidebar Panel ✅ installed (2.1s)` — `pi` install succeeded
+- `[3/18] Sidebar Panel ⏭ skipped (already installed)` — `pi` already present
+- `[3/18] Agents (auto-sync) ⏭ skipped (target exists)` — `copy` target already present
+- `[3/18] lean-ctx CLI ℹ hint: cargo install lean-ctx` — `check` probe missed
+- `[3/18] Sidebar Panel ❌ failed: <error>` — non-zero exit / thrown exception
+
+A single failure never aborts the run; subsequent items continue. When the
+last item finishes, the widget clears and a single notify summarises
+`Done. installed=X skipped=Y failed=Z (total N)` followed by the full result
+list and a `/reload` reminder.
+
+- `/ext install-all` — **one-shot setup**: installs every missing pi-type
+  companion, re-syncs `agents` (idempotent, skips existing files), probes the
+  CLI checks. No picker, no prompts.
+- `/ext all` — **deprecated alias** for `/ext install-all`; prints a warning
+  notify (`'all' is deprecated — use '/ext install-all'`) and then runs the
+  same one-shot path. Kept so existing muscle memory still works.
+- `/ext setup` — interactive checkbox picker (all selected by default,
+  grouped): space toggles a row, `a` selects all/none, enter runs the checked
+  ones, esc cancels.
+- `/ext setup <name> [<name>...]` — run named companions directly (still uses
+  the sequential runner and the same per-item progress widget).
+
+### 4. `/think` — cycle/set thinking level
 
 `/think` cycles `off → minimal → low → medium → high → xhigh → max`;
 `/think high` sets a specific level.
 
-### 4. Skill shortcuts
+### 5. Skill shortcuts
 
 - `/init` → forwards to `/skill:init` (root AGENTS.md)
 - `/init-deep` → forwards to `/skill:init-deep` (.architect shadow tree)
@@ -83,17 +138,18 @@ pi install npm:@aiwayds/pi-ext-fan
 Then, inside the pi session:
 
 ```
-/ext all    ← full setup: installs every missing companion, syncs agents, probes CLIs
-/reload     ← activates the newly installed extensions
+/ext install-all    ← full setup: installs every missing companion, syncs agents, probes CLIs
+/reload             ← activates the newly installed extensions
 ```
 
-That's it — `/ext all` skips anything already installed, re-syncs `agents`
-without touching existing files, and only *reports* a hint for missing CLIs.
-It's idempotent and safe to re-run anytime a companion is missing or a new
-agent file should be picked up.
+That's it — `/ext install-all` skips anything already installed, re-syncs
+`agents` without touching existing files, and only *reports* a hint for
+missing CLIs. It's idempotent and safe to re-run anytime a companion is
+missing or a new agent file should be picked up.
 
 Prefer a manual pick? Use `/ext setup` (interactive checkbox list) or
-`/ext setup <name>` for a single package. Check what's present with `/ext status`.
+`/ext setup <name>` for a single package. Check what's present with
+`/ext status` (or its `list` / `ls` aliases).
 
 ## License
 

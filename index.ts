@@ -16,12 +16,16 @@
  *   - clean-status → no longer needed (pi clears zombie status itself)
  *
  * Commands:
- *   /ext                — toggle at-agent on/off
- *   /ext status         — at-agent state + companion install status (grouped by aiwayds / rpiv / ecosystem)
- *   /ext all            — one-shot: install every missing pi-type, sync copy-type, probe check-type
- *   /ext setup          — interactive picker (all selected by default, grouped) → run chosen companions
- *   /ext setup <name>   — run one companion (pi install / copy sync / check probe)
- *   /think              — cycle/set thinking level
+ *   /ext                       — show help
+ *   /ext help                  — show help
+ *   /ext status | list | ls    — at-agent state + companion install status (grouped by aiwayds / rpiv / ecosystem)
+ *   /ext install-all           — one-shot: install every missing pi-type, sync copy-type, probe check-type
+ *   /ext all                   — deprecated, use '/ext install-all'
+ *   /ext setup                 — interactive picker (all selected by default, grouped) → run chosen companions
+ *   /ext setup <name>...       — run named companions (pi install / copy sync / check probe)
+ *   /ext on | off              — enable / disable @agent interception
+ *   /ext at-agent [on|off]     — toggle (default) or set @agent interception
+ *   /think                     — cycle/set thinking level
  */
 
 import type {
@@ -326,12 +330,19 @@ function companionDetail(c: Companion): string {
  * Copy companion agent files (fun-agent's agents/) into ~/.pi/agent/agents/.
  * Probes copyFrom in order (first existing dir wins). A file is copied only
  * when the target does NOT already exist — local customizations (e.g. a tuned
- * oldfox.md) are never overwritten. Returns copy statistics.
+ * oldfox.md) are never overwritten. Returns copy statistics; on a fatal error
+ * (e.g. mkdirSync EPERM/ENOSPC) the error is surfaced via `error` so the
+ * caller can mark the item failed without aborting the whole phase.
  */
 async function syncAgents(
   c: Companion,
   ctx: ExtensionContext,
-): Promise<{ copied: number; skipped: number; source?: string }> {
+): Promise<{
+  copied: number;
+  skipped: number;
+  source?: string;
+  error?: string;
+}> {
   const src = (c.copyFrom ?? []).find((d) => existsSync(d));
   if (!src) {
     ctx.ui.notify(
@@ -342,7 +353,15 @@ async function syncAgents(
   }
   const target = c.copyTo;
   if (!target) return { copied: 0, skipped: 0 };
-  fs.mkdirSync(target, { recursive: true });
+  try {
+    fs.mkdirSync(target, { recursive: true });
+  } catch (e) {
+    // mkdir failure (EPERM/ENOSPC/etc.) — don't crash the whole install run;
+    // caller surfaces this as a per-item failure in the summary notify.
+    const msg = (e as Error).message;
+    ctx.ui.notify(`agents: mkdir ${target} failed — ${msg}`, "error");
+    return { copied: 0, skipped: 0, source: src, error: msg };
+  }
   const files = c.files && c.files.length > 0 ? c.files : agentFilesIn(src);
   let copied = 0;
   let skipped = 0;
@@ -475,98 +494,292 @@ async function pickCompanions(ctx: ExtensionContext): Promise<string[] | null> {
   });
 }
 
-async function runSetup(
+// ═══════════════════════════════════════════════════════════════════
+// /ext subcommand dispatch + help (pure, exported for smoke-test)
+// ═══════════════════════════════════════════════════════════════════
+
+export type DispatchKind =
+  | "help"
+  | "status"
+  | "setup"
+  | "install-all"
+  | "at-agent-on"
+  | "at-agent-off"
+  | "at-agent-toggle"
+  | "error";
+
+export interface DispatchResult {
+  kind: DispatchKind;
+  /** Names passed after "setup". */
+  names?: string[];
+  /** Deprecated alias that triggered install-all (e.g. "all"). */
+  deprecatedAlias?: string;
+  /** Error message (when kind === "error"). */
+  message?: string;
+}
+
+/**
+ * Resolve a `/ext` argument string into a dispatch decision. No side effects —
+ * state mutation and UI calls happen in the caller. Exported so smoke-test can
+ * verify routing without spinning up a pi runtime.
+ */
+export function dispatchExt(args: string | undefined | null): DispatchResult {
+  const trimmed = (args ?? "").trim();
+  if (trimmed === "") return { kind: "help" };
+  const parts = trimmed.split(/\s+/);
+  const cmd = parts[0];
+
+  if (cmd === "help") return { kind: "help" };
+  if (cmd === "status" || cmd === "list" || cmd === "ls")
+    return { kind: "status" };
+  if (cmd === "setup") return { kind: "setup", names: parts.slice(1) };
+  if (cmd === "install-all") return { kind: "install-all" };
+  if (cmd === "all")
+    return { kind: "install-all", deprecatedAlias: "all" };
+  if (cmd === "on") return { kind: "at-agent-on" };
+  if (cmd === "off") return { kind: "at-agent-off" };
+  if (AT_AGENT_ALIASES.has(cmd)) {
+    const action = parts[1];
+    if (action === "on") return { kind: "at-agent-on" };
+    if (action === "off") return { kind: "at-agent-off" };
+    return { kind: "at-agent-toggle" };
+  }
+  return {
+    kind: "error",
+    message: `Unknown subcommand: ${cmd}. Try '/ext help'.`,
+  };
+}
+
+/** Help text shown by bare `/ext` and `/ext help`. */
+export const EXT_HELP_TEXT = [
+  "/ext commands:",
+  "  help                                  show this help",
+  "  status | list | ls                    at-agent state + companion install status",
+  "  install-all                           install every companion in dependency order",
+  "  all (deprecated: install-all)         alias kept for muscle memory",
+  "  setup [name ...]                      interactive picker (or run named companions)",
+  "  on | off                              enable / disable @agent interception",
+  "  at-agent [on|off]                     toggle (default) or set @agent interception",
+].join("\n");
+
+// ═══════════════════════════════════════════════════════════════════
+// Shared install runner (used by /ext install-all and /ext setup)
+// ═══════════════════════════════════════════════════════════════════
+
+const INSTALL_WIDGET_KEY = "ext-install-progress";
+
+/** Cap of widget lines the host renders (matches pi's MAX_WIDGET_LINES = 10).
+ *  We send a 1-line header + at most 9 body lines so the last in-progress row
+ *  and the most recent results stay visible even for the 18-item family. */
+const MAX_WIDGET_BODY_LINES = 9;
+
+type InstallSource = "setup" | "install-all";
+
+interface InstallOptions {
+  source: InstallSource;
+  /** When names is empty: show the picker. */
+  interactive: boolean;
+}
+
+const fmtElapsed = (ms: number): string => `${(ms / 1000).toFixed(1)}s`;
+
+/** Reentrancy guard: only one install-all / setup run at a time. */
+let installInFlight = false;
+
+/**
+ * Run pi → copy → check phases sequentially over the selected targets. Shows
+ * per-item progress in a setWidget above the editor (replaced in place after
+ * each item). A single failure never aborts the run. Returns when every item
+ * has been attempted; emits a final summary notify.
+ *
+ * The widget is always cleared in a `finally` block — even if a copy / exec
+ * throws synchronously out of runInstall — so a half-finished widget never
+ * gets stuck above the editor.
+ */
+async function runInstall(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   names: string[],
-  opts: { interactive?: boolean } = {},
+  opts: InstallOptions,
 ): Promise<void> {
-  const interactive = opts.interactive ?? true;
-  const hasNames = names.length > 0;
-  const targets0 = hasNames ? names : orderedCompanions().map(([n]) => n);
-  const unknown = targets0.filter((n) => !COMPANIONS[n]);
-  if (unknown.length > 0) {
-    ctx.ui.notify(
-      `Unknown companion: ${unknown.join(", ")}. Available: ${orderedCompanions()
-        .map(([n]) => n)
-        .join(", ")}`,
-      "error",
-    );
+  const { source, interactive } = opts;
+
+  // Reentrancy guard: refuse overlapping runs. Only one /ext install-all or
+  // /ext setup may be in flight at a time; the second call notifies and exits.
+  if (installInFlight) {
+    ctx.ui.notify("Install already in progress", "warning");
     return;
   }
-  let targets = targets0;
-  if (!hasNames && interactive) {
-    const picked = await pickCompanions(ctx);
-    if (picked === null) {
-      ctx.ui.notify("Setup cancelled", "info");
+  installInFlight = true;
+
+  try {
+    const hasNames = names.length > 0;
+    // Dedupe by name — `/ext setup a a b` or repeated entries in a future
+    // picker must not double-count toward `total`.
+    const targets0 = hasNames
+      ? [...new Set(names)]
+      : orderedCompanions().map(([n]) => n);
+
+    // Validate unknown names up front — fail fast with a single notify.
+    const unknown = targets0.filter((n) => !COMPANIONS[n]);
+    if (unknown.length > 0) {
+      ctx.ui.notify(
+        `Unknown companion: ${unknown.join(", ")}. Available: ${orderedCompanions()
+          .map(([n]) => n)
+          .join(", ")}`,
+        "error",
+      );
       return;
     }
-    targets = picked;
-    if (targets.length === 0) {
-      ctx.ui.notify("No companions selected — nothing to install", "warning");
-      return;
+
+    let targets = targets0;
+    if (!hasNames && interactive) {
+      const picked = await pickCompanions(ctx);
+      if (picked === null) {
+        ctx.ui.notify("Setup cancelled", "info");
+        return;
+      }
+      targets = picked;
+      if (targets.length === 0) {
+        ctx.ui.notify("No companions selected — nothing to install", "warning");
+        return;
+      }
     }
-  }
-  const results: string[] = [];
-  const sel = new Set(targets);
-  const groupTag = (g: CompanionGroup) => `[${g}]`;
-  // Phase 1 — install every selected pi-type companion (existing logic).
-  // Run first so copy-type items (which need fun-agent's agents on disk) work.
-  for (const [name] of orderedCompanions()) {
-    const c = COMPANIONS[name];
-    if (!sel.has(name) || c.type !== "pi") continue;
-    if (isCompanionInstalled(c)) {
-      results.push(`  ${groupTag(c.group)} ✅ ${c.label}: already installed`);
-      continue;
+
+    const total = targets.length;
+    const sel = new Set(targets);
+    const done: string[] = [];
+    let processed = 0;
+    const counts = { installed: 0, skipped: 0, failed: 0 };
+
+    const renderWidget = (inProgress?: string): void => {
+      const tail = inProgress ? [...done, inProgress] : done.slice();
+      const body = tail.slice(-MAX_WIDGET_BODY_LINES);
+      const header = `Installing ${processed}/${total} · installed=${counts.installed} skipped=${counts.skipped} failed=${counts.failed}`;
+      ctx.ui.setWidget(
+        INSTALL_WIDGET_KEY,
+        [header, ...body],
+        { placement: "aboveEditor" },
+      );
+    };
+
+    const nextIndex = (): string => {
+      processed++;
+      return `[${processed}/${total}]`;
+    };
+
+    // Phase 1 — pi-type (must complete first so fun-agent's files land before copy phase).
+    for (const [name] of orderedCompanions()) {
+      if (!sel.has(name)) continue;
+      const c = COMPANIONS[name];
+      if (c.type !== "pi") continue;
+      const idx = nextIndex();
+      renderWidget(`${idx} ${c.label} …`);
+      const t0 = Date.now();
+      if (isCompanionInstalled(c)) {
+        done.push(`${idx} ${c.label} ⏭ skipped (already installed)`);
+        counts.skipped++;
+        continue;
+      }
+      try {
+        const res = await pi.exec("pi", ["install", c.source!], {
+          cwd: process.cwd(),
+        });
+        const code =
+          (res as { code?: number; status?: number } | null)?.code ??
+          (res as { status?: number } | null)?.status ??
+          0;
+        const dt = Date.now() - t0;
+        if (code === 0) {
+          done.push(`${idx} ${c.label} ✅ installed (${fmtElapsed(dt)})`);
+          counts.installed++;
+        } else {
+          done.push(
+            `${idx} ${c.label} ❌ failed: pi install exited ${code} (${fmtElapsed(dt)})`,
+          );
+          counts.failed++;
+        }
+      } catch (e) {
+        const dt = Date.now() - t0;
+        done.push(
+          `${idx} ${c.label} ❌ failed: ${(e as Error).message} (${fmtElapsed(dt)})`,
+        );
+        counts.failed++;
+      }
     }
+
+    // Phase 2 — copy-type: sync fun-agent agents (idempotent, skips existing).
+    for (const [name] of orderedCompanions()) {
+      if (!sel.has(name)) continue;
+      const c = COMPANIONS[name];
+      if (c.type !== "copy") continue;
+      const idx = nextIndex();
+      renderWidget(`${idx} ${c.label} …`);
+      const t0 = Date.now();
+      if (isCompanionInstalled(c)) {
+        done.push(`${idx} ${c.label} ⏭ skipped (target exists)`);
+        counts.skipped++;
+        continue;
+      }
+      const r = await syncAgents(c, ctx);
+      const dt = Date.now() - t0;
+      if (r.error) {
+        // mkdirSync failure (or other fatal) inside syncAgents — count as
+        // failed so the summary reflects the broken item without aborting.
+        done.push(
+          `${idx} ${c.label} ❌ failed: ${r.error} (${fmtElapsed(dt)})`,
+        );
+        counts.failed++;
+      } else if (r.source && r.copied > 0) {
+        done.push(
+          `${idx} ${c.label} ✅ installed (copied ${r.copied}, ${fmtElapsed(dt)})`,
+        );
+        counts.installed++;
+      } else if (r.source) {
+        done.push(`${idx} ${c.label} ⏭ skipped (target exists)`);
+        counts.skipped++;
+      } else {
+        done.push(`${idx} ${c.label} ❌ failed: no source dir found`);
+        counts.failed++;
+      }
+    }
+
+    // Phase 3 — check-type: probe CLI presence; only emit a hint when missing.
+    for (const [name] of orderedCompanions()) {
+      if (!sel.has(name)) continue;
+      const c = COMPANIONS[name];
+      if (c.type !== "check") continue;
+      const idx = nextIndex();
+      renderWidget(`${idx} ${c.label} …`);
+      const t0 = Date.now();
+      if (isCompanionInstalled(c)) {
+        const dt = Date.now() - t0;
+        done.push(`${idx} ${c.label} ✅ installed (${fmtElapsed(dt)})`);
+        counts.installed++;
+      } else {
+        done.push(`${idx} ${c.label} ℹ hint: ${c.hint ?? "see package docs"}`);
+        counts.skipped++;
+      }
+    }
+
+    const summary = `Done. installed=${counts.installed} skipped=${counts.skipped} failed=${counts.failed} (total ${total})`;
+    const header = source === "install-all" ? "install-all:" : "setup:";
+    ctx.ui.notify(
+      `${header}\n${done.join("\n")}\n${summary}\nReload pi (/reload) to activate new extensions`,
+      counts.failed > 0 ? "warning" : "info",
+    );
+  } finally {
+    // Always clear the progress widget so it never gets stuck above the editor
+    // when a phase throws synchronously (e.g. EPERM on mkdir during copy).
+    // Reset the latch FIRST so a setWidget throw can never permanently jam
+    // installInFlight and reject every subsequent install.
+    installInFlight = false;
     try {
-      const res = await pi.exec("pi", ["install", c.source!], {
-        cwd: process.cwd(),
-      });
-      const code =
-        (res as { code?: number; status?: number } | null)?.code ??
-        (res as { status?: number } | null)?.status ??
-        0;
-      results.push(
-        code === 0
-          ? `  ${groupTag(c.group)} ✅ ${c.label}: installed (${c.source})`
-          : `  ${groupTag(c.group)} ❌ ${c.label}: pi install exited ${code}`,
-      );
-    } catch (e) {
-      results.push(
-        `  ${groupTag(c.group)} ❌ ${c.label}: FAILED — ${(e as Error).message}`,
-      );
+      ctx.ui.setWidget(INSTALL_WIDGET_KEY, undefined);
+    } catch {
+      // best-effort widget teardown; never let it affect the main flow
     }
   }
-  // Phase 2 — copy-type: sync fun-agent agents (idempotent, skips existing files).
-  for (const [name] of orderedCompanions()) {
-    const c = COMPANIONS[name];
-    if (!sel.has(name) || c.type !== "copy") continue;
-    const r = await syncAgents(c, ctx);
-    if (r.source) {
-      results.push(
-        `  ${groupTag(c.group)} ${r.copied > 0 ? "✅" : "ℹ️"} ${c.label}: synced (copied ${r.copied}, skipped ${r.skipped})`,
-      );
-    } else {
-      results.push(`  ${groupTag(c.group)} ❌ ${c.label}: no source dir found`);
-    }
-  }
-  // Phase 3 — check-type: probe CLI presence; only report a hint, never install.
-  for (const [name] of orderedCompanions()) {
-    const c = COMPANIONS[name];
-    if (!sel.has(name) || c.type !== "check") continue;
-    if (isCompanionInstalled(c)) {
-      results.push(`  ${groupTag(c.group)} ✅ ${c.label}: found`);
-    } else {
-      results.push(
-        `  ${groupTag(c.group)} ❌ ${c.label}: missing — install: ${c.hint ?? "see package docs"}`,
-      );
-    }
-  }
-  ctx.ui.notify(
-    `Setup:\n${results.join("\n")}\nReload pi (/reload) to activate new extensions`,
-    "info",
-  );
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -656,13 +869,21 @@ function registerAtAgent(pi: ExtensionAPI): void {
 function registerExtCommand(pi: ExtensionAPI): void {
   pi.registerCommand("ext", {
     description:
-      "Toggle at-agent, show status, or install companion extensions (setup)",
+      "Toggle at-agent, show status, or install companion extensions (try '/ext help')",
     handler: async (args: string, ctx) => {
-      const trimmed = args?.trim() || "";
-      const parts = trimmed.split(/\s+/);
-      const cmd = parts[0];
+      const d = dispatchExt(args);
 
-      if (cmd === "status") {
+      if (d.kind === "help") {
+        ctx.ui.notify(EXT_HELP_TEXT, "info");
+        return;
+      }
+
+      if (d.kind === "error") {
+        ctx.ui.notify(`${EXT_HELP_TEXT}\n\n${d.message}`, "error");
+        return;
+      }
+
+      if (d.kind === "status") {
         const lines = [`at-agent: ${state.atAgent ? "\u2705" : "\u274c"}`];
         let currentGroup: CompanionGroup | "" = "";
         for (const [name, c] of orderedCompanions()) {
@@ -678,53 +899,48 @@ function registerExtCommand(pi: ExtensionAPI): void {
         return;
       }
 
-      if (cmd === "setup") {
-        await runSetup(pi, ctx, parts.slice(1));
+      if (d.kind === "setup") {
+        await runInstall(pi, ctx, d.names ?? [], {
+          source: "setup",
+          interactive: true,
+        });
         return;
       }
 
-      if (cmd === "all") {
-        // One-shot family install: every missing companion, no picker, no prompts.
-        await runSetup(pi, ctx, [], { interactive: false });
+      if (d.kind === "install-all") {
+        if (d.deprecatedAlias) {
+          ctx.ui.notify(
+            `'${d.deprecatedAlias}' is deprecated — use '/ext install-all'`,
+            "warning",
+          );
+        }
+        await runInstall(pi, ctx, [], {
+          source: "install-all",
+          interactive: false,
+        });
         return;
       }
 
-      if (cmd === "on") {
+      if (d.kind === "at-agent-on") {
         state.atAgent = true;
         ctx.ui.notify("at-agent enabled", "info");
         return;
       }
 
-      if (cmd === "off") {
+      if (d.kind === "at-agent-off") {
         state.atAgent = false;
         ctx.ui.notify("at-agent disabled", "warning");
         return;
       }
 
-      if (AT_AGENT_ALIASES.has(cmd)) {
-        const action = parts[1];
-        if (action === "on") {
-          state.atAgent = true;
-          ctx.ui.notify("at-agent enabled", "info");
-        } else if (action === "off") {
-          state.atAgent = false;
-          ctx.ui.notify("at-agent disabled", "warning");
-        } else {
-          state.atAgent = !state.atAgent;
-          ctx.ui.notify(
-            `at-agent ${state.atAgent ? "enabled" : "disabled"}`,
-            state.atAgent ? "info" : "warning",
-          );
-        }
+      if (d.kind === "at-agent-toggle") {
+        state.atAgent = !state.atAgent;
+        ctx.ui.notify(
+          `at-agent ${state.atAgent ? "enabled" : "disabled"}`,
+          state.atAgent ? "info" : "warning",
+        );
         return;
       }
-
-      // bare /ext toggles at-agent
-      state.atAgent = !state.atAgent;
-      ctx.ui.notify(
-        `at-agent ${state.atAgent ? "enabled" : "disabled"}`,
-        state.atAgent ? "info" : "warning",
-      );
     },
   });
 }
