@@ -30,7 +30,7 @@ jobs:
     # job below is skipped with it via needs).
     if: github.repository == 'fan56/${{ github.event.repository.name }}'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     permissions:
       contents: read
       id-token: write # npm provenance (OIDC)
@@ -112,24 +112,42 @@ jobs:
           fi
           exit "${PUB_RC}"
         env:
+          # NOTE: this token is the same credential as the maintainer's local
+          # ~/.npmrc — rotate both together. A mismatch between the GitHub
+          # secret and the local npm login will fail publish with E401.
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Verify the publish actually landed
         # The registry sometimes commits the write and loses the response —
         # a green publish exit code is NOT proof. `npm view` seeing the
-        # version is the only acceptance signal.
+        # specific tag-pinned version is the only acceptance signal.
+        #
+        # npm registry propagation is not instant: a successful `npm publish`
+        # can take minutes to become visible to `npm view` on the same
+        # registry, especially right after the PUT lands. We poll for roughly
+        # 5 minutes total (sleep 12s between tries, ~25 attempts) before
+        # declaring failure. Window is bounded so a stuck publish still
+        # surfaces instead of hanging the workflow forever.
         run: |
           PKG="${{ steps.pkg.outputs.name }}"
           TAG_VERSION="${GITHUB_REF_NAME#v}"
-          for attempt in 1 2 3 4 5 6; do
+          # Total retry window: ~5 minutes. sleep seconds below * iteration
+          # count == ~300. Adjust the cap, not the per-try sleep, when tuning.
+          MAX_WAIT_SECONDS=300
+          SLEEP_SECONDS=12
+          ELAPSED=0
+          ATTEMPT=0
+          while [ "${ELAPSED}" -lt "${MAX_WAIT_SECONDS}" ]; do
+            ATTEMPT=$((ATTEMPT + 1))
             if npm view "${PKG}@${TAG_VERSION}" version >/dev/null 2>&1; then
-              echo "verified: ${PKG}@${TAG_VERSION} is visible on the registry (attempt ${attempt})"
+              echo "verified: ${PKG}@${TAG_VERSION} is visible on the registry (attempt ${ATTEMPT}, elapsed ${ELAPSED}s)"
               exit 0
             fi
-            echo "attempt ${attempt}: not visible yet; waiting 5s"
-            sleep 5
+            echo "attempt ${ATTEMPT}: ${PKG}@${TAG_VERSION} not visible yet (elapsed ${ELAPSED}s); sleeping ${SLEEP_SECONDS}s"
+            sleep "${SLEEP_SECONDS}"
+            ELAPSED=$((ELAPSED + SLEEP_SECONDS))
           done
-          echo "::error::publish reported success but npm view never saw ${PKG}@${TAG_VERSION} — inspect the registry manually before trusting this release"
+          echo "::error::publish reported success but npm view never saw ${PKG}@${TAG_VERSION} after ${ATTEMPT} attempts / ~${MAX_WAIT_SECONDS}s — inspect the registry manually before trusting this release"
           exit 1
 
   release:
