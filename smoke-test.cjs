@@ -5,6 +5,9 @@
 //        - '/ext all' triggers the deprecated-alias flag
 //        - '/ext list' and '/ext ls' route to the same kind as '/ext status'
 //        - at-agent family: 'on'/'off' + 'at-agent on'/'at-agent off'/bare
+//        - '/ext uninstall' (bare) routes to the uninstall kind, no names
+//        - '/ext uninstall <name>...' carries the names through dispatch
+//          (copy/check types are routed the same way; the runner skips them)
 //        - unknown subcommands return an error result (no crash)
 //        - undefined/null args don't crash and don't route to error
 //   3. EXT_HELP_TEXT is a non-empty string mentioning every subcommand.
@@ -96,6 +99,41 @@ const assert = (cond, msg) => {
     `SMOKE OK: at-agent family (on/off/at-agent on/off/bare + aliases) routes correctly`,
   );
 
+  // /ext uninstall — bare form routes to the uninstall kind with no names.
+  const uninstallBare = mod.dispatchExt("uninstall");
+  assert(
+    uninstallBare.kind === "uninstall" &&
+      Array.isArray(uninstallBare.names) &&
+      uninstallBare.names.length === 0,
+    `bare '/ext uninstall' should route to uninstall with empty names, got ${JSON.stringify(uninstallBare)}`,
+  );
+
+  // /ext uninstall <name>... — names pass through dispatch unchanged. We use
+  // a mix of pi-type (sidebar/footbar) and copy-type (agents) to confirm the
+  // dispatch layer is type-agnostic — the runner is what filters / skips.
+  const uninstallNamed = mod.dispatchExt("uninstall sidebar footbar");
+  assert(
+    uninstallNamed.kind === "uninstall" &&
+      Array.isArray(uninstallNamed.names) &&
+      uninstallNamed.names.length === 2 &&
+      uninstallNamed.names[0] === "sidebar" &&
+      uninstallNamed.names[1] === "footbar",
+    `'/ext uninstall sidebar footbar' should route to uninstall with names=['sidebar','footbar'], got ${JSON.stringify(uninstallNamed)}`,
+  );
+
+  const uninstallCopy = mod.dispatchExt("uninstall agents");
+  assert(
+    uninstallCopy.kind === "uninstall" &&
+      Array.isArray(uninstallCopy.names) &&
+      uninstallCopy.names.length === 1 &&
+      uninstallCopy.names[0] === "agents",
+    `'/ext uninstall agents' (copy type) should still route to uninstall — dispatch is type-agnostic, the runner decides what to skip. got ${JSON.stringify(uninstallCopy)}`,
+  );
+
+  console.log(
+    `SMOKE OK: '/ext uninstall' (bare + named + copy-type) routes to uninstall kind`,
+  );
+
   // Unknown subcommand returns an error result (no crash, no undefined).
   const bogus = mod.dispatchExt("bogus");
   assert(
@@ -137,6 +175,7 @@ const assert = (cond, msg) => {
     "ls",
     "install-all",
     "setup",
+    "uninstall",
     "on",
     "off",
     "at-agent",

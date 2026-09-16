@@ -23,9 +23,18 @@
  *   /ext all                   — deprecated, use '/ext install-all'
  *   /ext setup                 — interactive picker (all selected by default, grouped) → run chosen companions
  *   /ext setup <name>...       — run named companions (pi install / copy sync / check probe)
+ *   /ext uninstall             — interactive picker of installed pi-type → `pi remove` chosen
+ *   /ext uninstall <name>...   — `pi remove` named pi-type; copy/check types are skipped (not uninstallable)
  *   /ext on | off              — enable / disable @agent interception
  *   /ext at-agent [on|off]     — toggle (default) or set @agent interception
  *   /think                     — cycle/set thinking level
+ *
+ * Both install and uninstall share a single in-flight latch and progress widget:
+ *   - Install runs `pi install <source>`, syncs copy targets, probes check CLIs.
+ *   - Uninstall runs `pi remove <source>` for installed pi-type items only.
+ *     copy-type (agents/*.md) and check-type (CLI probes) are explicitly NOT
+ *     uninstalled — copy targets may carry user customizations, and check entries
+ *     describe external CLIs with no installed artefact on disk.
  */
 
 import type {
@@ -321,6 +330,17 @@ function orderedCompanions(): Array<[string, Companion]> {
   );
 }
 
+/** Companions eligible for `pi remove`: installed pi-type only.
+ *  copy-type (agents/*.md) and check-type (CLI probes) are NOT uninstallable
+ *  — copy targets may hold user customizations and check entries describe
+ *  external CLIs with no on-disk artefact. Used by the bare uninstall picker
+ *  filter and by the dispatcher's empty-installed fast-path. */
+function uninstallableCompanions(): Array<[string, Companion]> {
+  return orderedCompanions().filter(
+    ([, c]) => c.type === "pi" && isCompanionInstalled(c),
+  );
+}
+
 /** Detail suffix for picker/status rows: pi-type shows the npm pkg, others show the action type. */
 function companionDetail(c: Companion): string {
   return c.type === "pi" ? c.pkg : `[${c.type}]`;
@@ -396,20 +416,24 @@ interface PickerItem {
 }
 
 /**
- * Checkbox list for /ext setup: all companions checked by default,
- * space toggles a row, enter installs the checked ones, esc cancels.
+ * Checkbox list for /ext setup (install) and /ext uninstall: items are checked
+ * by default, space toggles a row, enter runs the checked ones, esc cancels.
+ * Header text + enter-action verb are passed in so the same widget works for
+ * both install and uninstall with appropriate wording.
  */
 class CompanionPicker {
   private items: PickerItem[];
   private checked = new Set<string>();
   private cursor = 0;
   private cache?: { width: number; lines: string[] };
+  private header: string;
 
   public onDone?: (names: string[]) => void;
   public onCancel?: () => void;
 
-  constructor(items: PickerItem[]) {
+  constructor(items: PickerItem[], header: string) {
     this.items = items;
+    this.header = header;
     for (const it of items) this.checked.add(it.name); // 默认全选
   }
 
@@ -445,12 +469,7 @@ class CompanionPicker {
   render(width: number, theme: Theme): string[] {
     if (this.cache && this.cache.width === width) return this.cache.lines;
     const lines: string[] = [
-      theme.bold(
-        truncateToWidth(
-          "Install companions — space: toggle · a: all/none · enter: install · esc: cancel",
-          width,
-        ),
-      ),
+      theme.bold(truncateToWidth(this.header, width)),
       "",
     ];
     for (let i = 0; i < this.items.length; i++) {
@@ -473,14 +492,28 @@ class CompanionPicker {
   }
 }
 
-async function pickCompanions(ctx: ExtensionContext): Promise<string[] | null> {
-  const items: PickerItem[] = orderedCompanions().map(([name, c]) => ({
+interface PickOptions {
+  /** "install": show all companions. "uninstall": only installed pi-type (copy/check not uninstallable). */
+  purpose: "install" | "uninstall";
+}
+
+async function pickCompanions(
+  ctx: ExtensionContext,
+  opts: PickOptions = { purpose: "install" },
+): Promise<string[] | null> {
+  const visible =
+    opts.purpose === "uninstall" ? uninstallableCompanions() : orderedCompanions();
+  const items: PickerItem[] = visible.map(([name, c]) => ({
     name,
     label: `${c.label} (${companionDetail(c)})`,
     installed: isCompanionInstalled(c),
   }));
+  const header =
+    opts.purpose === "uninstall"
+      ? "Uninstall companions — space: toggle · a: all/none · enter: remove · esc: cancel"
+      : "Install companions — space: toggle · a: all/none · enter: install · esc: cancel";
   return ctx.ui.custom<string[] | null>((tui, theme, _keybindings, done) => {
-    const picker = new CompanionPicker(items);
+    const picker = new CompanionPicker(items, header);
     picker.onDone = done;
     picker.onCancel = () => done(null);
     return {
@@ -503,6 +536,7 @@ export type DispatchKind =
   | "status"
   | "setup"
   | "install-all"
+  | "uninstall"
   | "at-agent-on"
   | "at-agent-off"
   | "at-agent-toggle"
@@ -510,7 +544,7 @@ export type DispatchKind =
 
 export interface DispatchResult {
   kind: DispatchKind;
-  /** Names passed after "setup". */
+  /** Names passed after "setup" or "uninstall" (empty → picker or one-shot). */
   names?: string[];
   /** Deprecated alias that triggered install-all (e.g. "all"). */
   deprecatedAlias?: string;
@@ -536,6 +570,7 @@ export function dispatchExt(args: string | undefined | null): DispatchResult {
   if (cmd === "install-all") return { kind: "install-all" };
   if (cmd === "all")
     return { kind: "install-all", deprecatedAlias: "all" };
+  if (cmd === "uninstall") return { kind: "uninstall", names: parts.slice(1) };
   if (cmd === "on") return { kind: "at-agent-on" };
   if (cmd === "off") return { kind: "at-agent-off" };
   if (AT_AGENT_ALIASES.has(cmd)) {
@@ -558,33 +593,39 @@ export const EXT_HELP_TEXT = [
   "  install-all                           install every companion in dependency order",
   "  all (deprecated: install-all)         alias kept for muscle memory",
   "  setup [name ...]                      interactive picker (or run named companions)",
+  "  uninstall [name ...]                  picker of installed pi-type, or `pi remove` named",
+  "                                        (copy/check types are not uninstallable)",
   "  on | off                              enable / disable @agent interception",
   "  at-agent [on|off]                     toggle (default) or set @agent interception",
 ].join("\n");
 
 // ═══════════════════════════════════════════════════════════════════
-// Shared install runner (used by /ext install-all and /ext setup)
+// Shared companion-op runner (used by /ext install-all, /ext setup, /ext uninstall)
 // ═══════════════════════════════════════════════════════════════════
 
-const INSTALL_WIDGET_KEY = "ext-install-progress";
+const EXT_OP_WIDGET_KEY = "ext-op-progress";
 
 /** Cap of widget lines the host renders (matches pi's MAX_WIDGET_LINES = 10).
  *  We send a 1-line header + at most 9 body lines so the last in-progress row
  *  and the most recent results stay visible even for the 18-item family. */
 const MAX_WIDGET_BODY_LINES = 9;
 
-type InstallSource = "setup" | "install-all";
+type CompanionAction = "install" | "uninstall";
+/** Origin command — controls header prefix in the summary notify. */
+type OpSource = "setup" | "install-all" | "uninstall";
 
-interface InstallOptions {
-  source: InstallSource;
-  /** When names is empty: show the picker. */
+interface RunOptions {
+  action: CompanionAction;
+  source: OpSource;
+  /** When true and names is empty: show the picker. */
   interactive: boolean;
 }
 
 const fmtElapsed = (ms: number): string => `${(ms / 1000).toFixed(1)}s`;
 
-/** Reentrancy guard: only one install-all / setup run at a time. */
-let installInFlight = false;
+/** Reentrancy guard: only one companion-op (install or uninstall) at a time.
+ *  Tracks which action is in flight so the rejection notify can name it. */
+let opInFlight: CompanionAction | null = null;
 
 /**
  * Run pi → copy → check phases sequentially over the selected targets. Shows
@@ -592,25 +633,33 @@ let installInFlight = false;
  * each item). A single failure never aborts the run. Returns when every item
  * has been attempted; emits a final summary notify.
  *
+ * The action discriminator ("install" | "uninstall") flips each phase:
+ *   - pi-type    : `pi install <source>`  vs  `pi remove <source>` (only if installed)
+ *   - copy-type   : syncAgents()          vs  skipped (copy targets may be user-edited)
+ *   - check-type  : probe CLI presence    vs  skipped (no installed artefact)
+ *
  * The widget is always cleared in a `finally` block — even if a copy / exec
- * throws synchronously out of runInstall — so a half-finished widget never
- * gets stuck above the editor.
+ * throws synchronously out of runCompanionOp — so a half-finished widget
+ * never gets stuck above the editor.
  */
-async function runInstall(
+async function runCompanionOp(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   names: string[],
-  opts: InstallOptions,
+  opts: RunOptions,
 ): Promise<void> {
-  const { source, interactive } = opts;
+  const { action, source, interactive } = opts;
+  const verb = action === "install" ? "installed" : "removed";
 
-  // Reentrancy guard: refuse overlapping runs. Only one /ext install-all or
-  // /ext setup may be in flight at a time; the second call notifies and exits.
-  if (installInFlight) {
-    ctx.ui.notify("Install already in progress", "warning");
+  // Reentrancy guard: refuse overlapping companion-op runs. Install and
+  // uninstall share the same latch; the rejection message names whichever
+  // action is currently in flight.
+  if (opInFlight) {
+    const cap = opInFlight === "install" ? "Install" : "Uninstall";
+    ctx.ui.notify(`${cap} already in progress`, "warning");
     return;
   }
-  installInFlight = true;
+  opInFlight = action;
 
   try {
     const hasNames = names.length > 0;
@@ -634,14 +683,18 @@ async function runInstall(
 
     let targets = targets0;
     if (!hasNames && interactive) {
-      const picked = await pickCompanions(ctx);
+      const picked = await pickCompanions(ctx, { purpose: action });
       if (picked === null) {
-        ctx.ui.notify("Setup cancelled", "info");
+        const cap = action === "install" ? "Setup" : "Uninstall";
+        ctx.ui.notify(`${cap} cancelled`, "info");
         return;
       }
       targets = picked;
       if (targets.length === 0) {
-        ctx.ui.notify("No companions selected — nothing to install", "warning");
+        ctx.ui.notify(
+          `No companions selected — nothing to ${action}`,
+          "warning",
+        );
         return;
       }
     }
@@ -651,13 +704,17 @@ async function runInstall(
     const done: string[] = [];
     let processed = 0;
     const counts = { installed: 0, skipped: 0, failed: 0 };
+    // The counts object's primary field is always `installed`; the displayed
+    // label switches between "installed" and "removed" per action verb.
+    const headLabel = action === "install" ? "installed" : "removed";
 
     const renderWidget = (inProgress?: string): void => {
       const tail = inProgress ? [...done, inProgress] : done.slice();
       const body = tail.slice(-MAX_WIDGET_BODY_LINES);
-      const header = `Installing ${processed}/${total} · installed=${counts.installed} skipped=${counts.skipped} failed=${counts.failed}`;
+      const headVerb = action === "install" ? "Installing" : "Uninstalling";
+      const header = `${headVerb} ${processed}/${total} · ${headLabel}=${counts.installed} skipped=${counts.skipped} failed=${counts.failed}`;
       ctx.ui.setWidget(
-        INSTALL_WIDGET_KEY,
+        EXT_OP_WIDGET_KEY,
         [header, ...body],
         { placement: "aboveEditor" },
       );
@@ -676,39 +733,81 @@ async function runInstall(
       const idx = nextIndex();
       renderWidget(`${idx} ${c.label} …`);
       const t0 = Date.now();
-      if (isCompanionInstalled(c)) {
-        done.push(`${idx} ${c.label} ⏭ skipped (already installed)`);
-        counts.skipped++;
-        continue;
-      }
-      try {
-        const res = await pi.exec("pi", ["install", c.source!], {
-          cwd: process.cwd(),
-        });
-        const code =
-          (res as { code?: number; status?: number } | null)?.code ??
-          (res as { status?: number } | null)?.status ??
-          0;
-        const dt = Date.now() - t0;
-        if (code === 0) {
-          done.push(`${idx} ${c.label} ✅ installed (${fmtElapsed(dt)})`);
-          counts.installed++;
-        } else {
+      if (action === "install") {
+        if (isCompanionInstalled(c)) {
+          done.push(`${idx} ${c.label} ⏭ skipped (already installed)`);
+          counts.skipped++;
+          continue;
+        }
+        try {
+          const res = await pi.exec("pi", ["install", c.source!], {
+            cwd: process.cwd(),
+          });
+          const code =
+            (res as { code?: number; status?: number } | null)?.code ??
+            (res as { status?: number } | null)?.status ??
+            0;
+          const dt = Date.now() - t0;
+          if (code === 0) {
+            done.push(`${idx} ${c.label} ✅ installed (${fmtElapsed(dt)})`);
+            counts.installed++;
+          } else {
+            done.push(
+              `${idx} ${c.label} ❌ failed: pi install exited ${code} (${fmtElapsed(dt)})`,
+            );
+            counts.failed++;
+          }
+        } catch (e) {
+          const dt = Date.now() - t0;
           done.push(
-            `${idx} ${c.label} ❌ failed: pi install exited ${code} (${fmtElapsed(dt)})`,
+            `${idx} ${c.label} ❌ failed: ${(e as Error).message} (${fmtElapsed(dt)})`,
           );
           counts.failed++;
         }
-      } catch (e) {
-        const dt = Date.now() - t0;
-        done.push(
-          `${idx} ${c.label} ❌ failed: ${(e as Error).message} (${fmtElapsed(dt)})`,
-        );
-        counts.failed++;
+      } else {
+        // uninstall
+        if (!isCompanionInstalled(c)) {
+          done.push(`${idx} ${c.label} ⏭ skipped (not installed)`);
+          counts.skipped++;
+          continue;
+        }
+        // Known limitation: `pi remove` matches against the registered
+        // source string. Every COMPANIONS entry today uses an `npm:...`
+        // source (see isCompanionInstalled's local-path fallback for how
+        // detection tolerates those), but if a companion ever ships with a
+        // local-path source (e.g. "../../github/pi-model-favorites"), the
+        // same local-path string must be passed here or pi will refuse to
+        // find it. Today this branch is unreachable for that case because
+        // no COMPANIONS entry registers as a local path.
+        try {
+          const res = await pi.exec("pi", ["remove", c.source!], {
+            cwd: process.cwd(),
+          });
+          const code =
+            (res as { code?: number; status?: number } | null)?.code ??
+            (res as { status?: number } | null)?.status ??
+            0;
+          const dt = Date.now() - t0;
+          if (code === 0) {
+            done.push(`${idx} ${c.label} ✅ removed (${fmtElapsed(dt)})`);
+            counts.installed++;
+          } else {
+            done.push(
+              `${idx} ${c.label} ❌ failed: pi remove exited ${code} (${fmtElapsed(dt)})`,
+            );
+            counts.failed++;
+          }
+        } catch (e) {
+          const dt = Date.now() - t0;
+          done.push(
+            `${idx} ${c.label} ❌ failed: ${(e as Error).message} (${fmtElapsed(dt)})`,
+          );
+          counts.failed++;
+        }
       }
     }
 
-    // Phase 2 — copy-type: sync fun-agent agents (idempotent, skips existing).
+    // Phase 2 — copy-type: sync fun-agent agents on install, skip on uninstall.
     for (const [name] of orderedCompanions()) {
       if (!sel.has(name)) continue;
       const c = COMPANIONS[name];
@@ -716,35 +815,45 @@ async function runInstall(
       const idx = nextIndex();
       renderWidget(`${idx} ${c.label} …`);
       const t0 = Date.now();
-      if (isCompanionInstalled(c)) {
-        done.push(`${idx} ${c.label} ⏭ skipped (target exists)`);
-        counts.skipped++;
-        continue;
-      }
-      const r = await syncAgents(c, ctx);
-      const dt = Date.now() - t0;
-      if (r.error) {
-        // mkdirSync failure (or other fatal) inside syncAgents — count as
-        // failed so the summary reflects the broken item without aborting.
-        done.push(
-          `${idx} ${c.label} ❌ failed: ${r.error} (${fmtElapsed(dt)})`,
-        );
-        counts.failed++;
-      } else if (r.source && r.copied > 0) {
-        done.push(
-          `${idx} ${c.label} ✅ installed (copied ${r.copied}, ${fmtElapsed(dt)})`,
-        );
-        counts.installed++;
-      } else if (r.source) {
-        done.push(`${idx} ${c.label} ⏭ skipped (target exists)`);
-        counts.skipped++;
+      if (action === "install") {
+        if (isCompanionInstalled(c)) {
+          done.push(`${idx} ${c.label} ⏭ skipped (target exists)`);
+          counts.skipped++;
+          continue;
+        }
+        const r = await syncAgents(c, ctx);
+        const dt = Date.now() - t0;
+        if (r.error) {
+          // mkdirSync failure (or other fatal) inside syncAgents — count as
+          // failed so the summary reflects the broken item without aborting.
+          done.push(
+            `${idx} ${c.label} ❌ failed: ${r.error} (${fmtElapsed(dt)})`,
+          );
+          counts.failed++;
+        } else if (r.source && r.copied > 0) {
+          done.push(
+            `${idx} ${c.label} ✅ installed (copied ${r.copied}, ${fmtElapsed(dt)})`,
+          );
+          counts.installed++;
+        } else if (r.source) {
+          done.push(`${idx} ${c.label} ⏭ skipped (target exists)`);
+          counts.skipped++;
+        } else {
+          done.push(`${idx} ${c.label} ❌ failed: no source dir found`);
+          counts.failed++;
+        }
       } else {
-        done.push(`${idx} ${c.label} ❌ failed: no source dir found`);
-        counts.failed++;
+        // uninstall: copy-type targets may carry user customizations; this
+        // version never deletes them. Skipped (not a failure). No (X.Xs)
+        // suffix — ⏭/ℹ lines are no-op decisions, not timed work.
+        done.push(
+          `${idx} ${c.label} ⏭ skipped (not uninstallable: copy targets may be user-edited)`,
+        );
+        counts.skipped++;
       }
     }
 
-    // Phase 3 — check-type: probe CLI presence; only emit a hint when missing.
+    // Phase 3 — check-type: probe CLI presence on install, skip on uninstall.
     for (const [name] of orderedCompanions()) {
       if (!sel.has(name)) continue;
       const c = COMPANIONS[name];
@@ -752,30 +861,53 @@ async function runInstall(
       const idx = nextIndex();
       renderWidget(`${idx} ${c.label} …`);
       const t0 = Date.now();
-      if (isCompanionInstalled(c)) {
-        const dt = Date.now() - t0;
-        done.push(`${idx} ${c.label} ✅ installed (${fmtElapsed(dt)})`);
-        counts.installed++;
+      if (action === "install") {
+        if (isCompanionInstalled(c)) {
+          const dt = Date.now() - t0;
+          done.push(`${idx} ${c.label} ✅ installed (${fmtElapsed(dt)})`);
+          counts.installed++;
+        } else {
+          done.push(`${idx} ${c.label} ℹ hint: ${c.hint ?? "see package docs"}`);
+          counts.skipped++;
+        }
       } else {
-        done.push(`${idx} ${c.label} ℹ hint: ${c.hint ?? "see package docs"}`);
+        // uninstall: check entries describe external CLIs with no installed
+        // artefact on disk — nothing to remove. Skipped (not a failure).
+        // No (X.Xs) suffix — ⏭/ℹ lines are no-op decisions, not timed work.
+        done.push(
+          `${idx} ${c.label} ⏭ skipped (not uninstallable: check entries are CLI probes only)`,
+        );
         counts.skipped++;
       }
     }
 
-    const summary = `Done. installed=${counts.installed} skipped=${counts.skipped} failed=${counts.failed} (total ${total})`;
-    const header = source === "install-all" ? "install-all:" : "setup:";
+    const summary = `Done. ${verb}=${counts.installed} skipped=${counts.skipped} failed=${counts.failed} (total ${total})`;
+    const header =
+      source === "install-all"
+        ? "install-all:"
+        : source === "setup"
+          ? "setup:"
+          : "uninstall:";
+    // Install copies new files into ~/.pi/agent and registers packages —
+    // pi only re-reads that directory on /reload, so a separate hint is
+    // required. Uninstall removes packages but never re-reads, so a
+    // shorter "run /reload to apply" reminder is enough.
+    const tail =
+      action === "install"
+        ? "Reload pi (/reload) to activate new extensions"
+        : "run /reload to apply";
     ctx.ui.notify(
-      `${header}\n${done.join("\n")}\n${summary}\nReload pi (/reload) to activate new extensions`,
+      `${header}\n${done.join("\n")}\n${summary}\n${tail}`,
       counts.failed > 0 ? "warning" : "info",
     );
   } finally {
     // Always clear the progress widget so it never gets stuck above the editor
     // when a phase throws synchronously (e.g. EPERM on mkdir during copy).
     // Reset the latch FIRST so a setWidget throw can never permanently jam
-    // installInFlight and reject every subsequent install.
-    installInFlight = false;
+    // opInFlight and reject every subsequent companion op.
+    opInFlight = null;
     try {
-      ctx.ui.setWidget(INSTALL_WIDGET_KEY, undefined);
+      ctx.ui.setWidget(EXT_OP_WIDGET_KEY, undefined);
     } catch {
       // best-effort widget teardown; never let it affect the main flow
     }
@@ -869,7 +1001,7 @@ function registerAtAgent(pi: ExtensionAPI): void {
 function registerExtCommand(pi: ExtensionAPI): void {
   pi.registerCommand("ext", {
     description:
-      "Toggle at-agent, show status, or install companion extensions (try '/ext help')",
+      "Toggle at-agent, show status, or install/uninstall companion extensions (try '/ext help')",
     handler: async (args: string, ctx) => {
       const d = dispatchExt(args);
 
@@ -900,7 +1032,8 @@ function registerExtCommand(pi: ExtensionAPI): void {
       }
 
       if (d.kind === "setup") {
-        await runInstall(pi, ctx, d.names ?? [], {
+        await runCompanionOp(pi, ctx, d.names ?? [], {
+          action: "install",
           source: "setup",
           interactive: true,
         });
@@ -914,8 +1047,59 @@ function registerExtCommand(pi: ExtensionAPI): void {
             "warning",
           );
         }
-        await runInstall(pi, ctx, [], {
+        await runCompanionOp(pi, ctx, [], {
+          action: "install",
           source: "install-all",
+          interactive: false,
+        });
+        return;
+      }
+
+      if (d.kind === "uninstall") {
+        const names = d.names ?? [];
+        if (names.length > 0) {
+          // Direct path: `pi remove` named items; copy/check are skipped by
+          // the runner's per-type logic. Unknown names are surfaced by the
+          // runner's up-front validation.
+          await runCompanionOp(pi, ctx, names, {
+            action: "uninstall",
+            source: "uninstall",
+            interactive: false,
+          });
+          return;
+        }
+        // Bare: picker of installed pi-type only. Fast-path when nothing is
+        // installed so we don't bother the user with an empty picker.
+        const installed = uninstallableCompanions();
+        if (installed.length === 0) {
+          ctx.ui.notify("No installed pi-type companions to uninstall", "info");
+          return;
+        }
+        // Pre-guard before the picker: refuse the bare `/ext uninstall` UI
+        // (and its filter cost) when another companion-op is already in
+        // flight. The runner has its own opInFlight check, but the picker
+        // path runs *before* the runner and would otherwise flash a UI
+        // surface that's about to be rejected.
+        if (opInFlight) {
+          const cap = opInFlight === "install" ? "Install" : "Uninstall";
+          ctx.ui.notify(`${cap} already in progress`, "warning");
+          return;
+        }
+        const picked = await pickCompanions(ctx, { purpose: "uninstall" });
+        if (picked === null) {
+          ctx.ui.notify("Uninstall cancelled", "info");
+          return;
+        }
+        if (picked.length === 0) {
+          ctx.ui.notify(
+            "No companions selected — nothing to uninstall",
+            "warning",
+          );
+          return;
+        }
+        await runCompanionOp(pi, ctx, picked, {
+          action: "uninstall",
+          source: "uninstall",
           interactive: false,
         });
         return;

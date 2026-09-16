@@ -22,6 +22,8 @@ Bare `/ext` (or `/ext help`) prints the subcommand summary:
   status | list | ls                    at-agent state + companion install status
   install-all                           install every companion in dependency order
   setup [name ...]                      interactive picker (or run named companions)
+  uninstall [name ...]                  picker of installed pi-type, or `pi remove` named
+                                        (copy/check types are not uninstallable)
   on | off                              enable / disable @agent interception
   at-agent [on|off]                     toggle (default) or set @agent interception
 ```
@@ -86,14 +88,32 @@ the `copy` sync (depends on fun-agent's agents being on disk), then the
 `check` probes — and within each phase the list order is preserved (never
 concurrent).
 
+`/ext uninstall` and `/ext uninstall <name>...` share the same runner with
+the `action="uninstall"` flag. The dependency order is preserved (pi-type
+attempts come first), but the per-phase handling diverges:
+
+- `pi`-type — `pi remove <source>` is invoked only for currently installed
+  items; not-installed items are skipped.
+- `copy`-type — **skipped (not uninstallable)**. The synced agent files in
+  `~/.pi/agent/agents/` may carry user customizations, so deleting them
+  would be destructive. This version never removes them.
+- `check`-type — **skipped (not uninstallable)**. These entries describe
+  external CLIs (`lean-ctx`, etc.) with no installed artefact on disk; the
+  user is expected to uninstall the CLI through its own package manager.
+
+Both operations share a single in-flight latch: an `/ext install-all` (or
+`/ext setup`) started while `/ext uninstall` is running (and vice versa) is
+rejected with a notify naming whichever action is currently in flight.
+
 Per-item progress is rendered in an editor widget above the input, updated
 in place after each item. The widget shows a 1-line counter header (e.g.
-`Installing 12/18 · installed=5 skipped=3 failed=1`) followed by the **last 9
+`Installing 12/18 · installed=5 skipped=3 failed=1` or
+`Uninstalling 3/8 · removed=2 skipped=1 failed=0`) followed by the **last 9
 lines** — the most recent results plus the current in-progress row. Older
 results scroll off the top as the run continues; the full list and a final
 `Done.` summary arrive in the notify once the run completes.
 
-Line shapes:
+Line shapes (install):
 
 - `[3/18] Sidebar Panel …` — starting
 - `[3/18] Sidebar Panel ✅ installed (2.1s)` — `pi` install succeeded
@@ -102,10 +122,22 @@ Line shapes:
 - `[3/18] lean-ctx CLI ℹ hint: cargo install lean-ctx` — `check` probe missed
 - `[3/18] Sidebar Panel ❌ failed: <error>` — non-zero exit / thrown exception
 
+Line shapes (uninstall):
+
+- `[3/8] Sidebar Panel …` — starting
+- `[3/8] Sidebar Panel ✅ removed (1.8s)` — `pi remove` succeeded
+- `[3/8] Sidebar Panel ⏭ skipped (not installed)` — `pi` not currently installed
+- `[3/8] Agents (auto-sync) ⏭ skipped (not uninstallable: copy targets may be user-edited)` — `copy` type refused
+- `[3/8] lean-ctx CLI ⏭ skipped (not uninstallable: check entries are CLI probes only)` — `check` type refused
+- `[3/8] Sidebar Panel ❌ failed: <error>` — non-zero exit / thrown exception
+
 A single failure never aborts the run; subsequent items continue. When the
 last item finishes, the widget clears and a single notify summarises
-`Done. installed=X skipped=Y failed=Z (total N)` followed by the full result
-list and a `/reload` reminder.
+`Done. installed=X skipped=Y failed=Z (total N)` (install) or
+`Done. removed=X skipped=Y failed=Z (total N)` (uninstall), followed by the
+full result list and an action-specific reload reminder — install runs
+`Reload pi (/reload) to activate new extensions`, uninstall runs
+`run /reload to apply`.
 
 - `/ext install-all` — **one-shot setup**: installs every missing pi-type
   companion, re-syncs `agents` (idempotent, skips existing files), probes the
@@ -118,6 +150,14 @@ list and a `/reload` reminder.
   ones, esc cancels.
 - `/ext setup <name> [<name>...]` — run named companions directly (still uses
   the sequential runner and the same per-item progress widget).
+- `/ext uninstall` — interactive picker of **currently installed `pi`-type**
+  companions only (copy/check are filtered out — they're not uninstallable).
+  Same space/`a`/enter/esc keys as `/ext setup`; same progress widget and
+  summary format with `removed=` instead of `installed=`.
+- `/ext uninstall <name> [<name>...]` — `pi remove` named items directly.
+  `copy` and `check` items are accepted at the dispatch layer (so muscle
+  memory like `/ext uninstall agents` doesn't error) but skipped in the
+  runner with a clear reason; unknown names are rejected up front.
 
 ### 4. `/think` — cycle/set thinking level
 
