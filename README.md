@@ -57,7 +57,6 @@ three action types:
 | `footbar` | Powerline Footer | `npm:@aiwayds/pi-powerline-footer` |
 | `cron` | Kimi Cron | `npm:@aiwayds/pi-kimi-cron` |
 | `think-panel` | Think Panel | `npm:@aiwayds/pi-think-panel` |
-| `bailian` | Bailian Token Plan | `npm:@aiwayds/pi-bailian-token-plan` |
 | `jarvis` | Jarvis Sphere | `npm:@aiwayds/pi-jarvis-sphere` |
 | `model-favs` | Model Favorites | `npm:@aiwayds/pi-model-favorites` |
 | `topic-memory` | Topic Memory | `npm:@aiwayds/pi-topic-memory` |

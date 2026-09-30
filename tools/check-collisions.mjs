@@ -22,12 +22,11 @@ import { join } from "node:path";
 
 // name → { pkg, type } — exact mirror of index.ts COMPANIONS.
 const COMPANIONS = {
-  // aiwayds group (9) — pi
+  // aiwayds group (8) — pi
   sidebar: { pkg: "@aiwayds/pi-sidebar-panel", type: "pi" },
   footbar: { pkg: "@aiwayds/pi-powerline-footer", type: "pi" },
   cron: { pkg: "@aiwayds/pi-kimi-cron", type: "pi" },
   "think-panel": { pkg: "@aiwayds/pi-think-panel", type: "pi" },
-  bailian: { pkg: "@aiwayds/pi-bailian-token-plan", type: "pi" },
   jarvis: { pkg: "@aiwayds/pi-jarvis-sphere", type: "pi" },
   "model-favs": { pkg: "@aiwayds/pi-model-favorites", type: "pi" },
   "topic-memory": { pkg: "@aiwayds/pi-topic-memory", type: "pi" },

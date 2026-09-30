@@ -94,7 +94,7 @@ interface Companion {
 }
 
 const COMPANIONS: Record<string, Companion> = {
-  // ── aiwayds group (9) — pi install ───────────────────────────────
+  // ── aiwayds group (8) — pi install ───────────────────────────────
   sidebar: {
     label: "Sidebar Panel",
     pkg: "@aiwayds/pi-sidebar-panel",
@@ -122,13 +122,6 @@ const COMPANIONS: Record<string, Companion> = {
     group: "aiwayds",
     type: "pi",
     source: "npm:@aiwayds/pi-think-panel",
-  },
-  bailian: {
-    label: "Bailian Token Plan",
-    pkg: "@aiwayds/pi-bailian-token-plan",
-    group: "aiwayds",
-    type: "pi",
-    source: "npm:@aiwayds/pi-bailian-token-plan",
   },
   jarvis: {
     label: "Jarvis Sphere",
